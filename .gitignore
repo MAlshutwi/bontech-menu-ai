@@ -1,0 +1,26 @@
+# ===== Secrets (NEVER commit) =====
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+
+# ===== Data / artifacts (regenerable; contain business-sensitive menu/score data) =====
+# كل المخرجات قابلة لإعادة التوليد عبر scripts/ — لا تُلتزم (تحتوي أسماء أصناف ودرجات)
+artifacts/
+*.csv
+*.log
+
+# ===== OS =====
+Thumbs.db
+.DS_Store

@@ -1,0 +1,150 @@
+# ============================================================
+# config.yaml — كل الـ thresholds والأوزان قابلة للتعديل من هنا
+# (لا توجد أسرار هنا؛ بيانات الاتصال في ملف .env)
+# ============================================================
+
+model_version: "v1.1.0"   # Phase 10: rails + time-aware signal (champion cross_sell ثابت)
+
+# --- قواعد تنظيف السلال (تُطبّق في كل السحوبات) ---
+cleaning:
+  exclude_canceled_orders: true     # ro.canceledate IS NULL
+  exclude_deleted_orders: true      # ro.isdeleted = false
+  exclude_deleted_lines: true       # mir.isdeleted = false
+  exclude_wasted_lines: true        # mir.iswasted = false
+  exclude_recalled_lines: true      # mir.isrecalled = false
+  main_items_only: true             # mir.parentid IS NULL  (نتجاهل modifiers/add-ons)
+
+# --- عتبات البناء ---
+thresholds:
+  min_orders_per_restaurant_fbt: 300   # أقل عدد طلبات لبناء FBT للمطعم
+  min_orders_per_restaurant_pop: 30    # أقل عدد طلبات لبناء popularity
+  popularity_top_n: 25                 # كم صنف شعبي نخزّن لكل مطعم
+  global_common_top_n: 30              # كم صنف مشترك عام نخزّن
+
+# --- نموذج FBT (ترتيب المرشّحات داخل المطعم) ---
+fbt:
+  min_pair_count: 10            # أقل عدد اقتران للزوج عشان نثق فيه
+  min_confidence: 0.02          # أقل confidence مقبول
+  top_n_store: 25               # كم توصية نخزّن لكل صنف
+  ranking: "hybrid"             # confidence | lift | pair_count | hybrid
+  # أوزان الـ hybrid pair score (يُطبّع كل مكوّن min-max داخل مرشّحات نفس الصنف)
+  pair_score_weights:
+    confidence: 0.60
+    lift: 0.25
+    pair_count: 0.15
+
+# --- اكتشاف الأصناف المشتركة بين المطاعم ---
+normalization:
+  lowercase: true
+  strip_diacritics: true        # إزالة التشكيل العربي
+  normalize_arabic: true        # توحيد الألف/التاء المربوطة/الياء
+  remove_symbols: true
+  collapse_spaces: true
+  min_restaurants_for_common: 4 # الاسم يظهر في >= N مطعم => صنف مشترك عام
+
+# --- التقييم (offline) ---
+evaluation:
+  test_fraction: 0.20           # آخر ~20% من الطلبات (زمنيًا) للاختبار
+  k_values: [5, 10]
+  min_test_trials: 50           # نتجاهل المطاعم بعينة اختبار أصغر من هذا
+  strategies:                   # الاستراتيجيات اللي نقارنها
+    - popularity
+    - fbt_confidence
+    - fbt_lift
+    - fbt_paircount
+    - fbt_hybrid
+
+# --- الـ Hybrid Ranker النهائي (دمج مصادر التوصية) ---
+hybrid_weights:
+  restaurant_fbt: 0.45
+  restaurant_popularity: 0.20
+  customer_affinity: 0.15
+  global_common: 0.10
+  recency: 0.10
+  # لو ما فيه customer_id: نعيد توزيع وزن customer_affinity على fbt+popularity بنسبتهما.
+
+# --- موديول العميل (خامل افتراضيًا — لا يوجد ربط طلب↔عميل كافٍ) ---
+customer:
+  enabled: true                 # الواجهة شغّالة؛ تُفعّل فعليًا لو توفّر profile
+  # مصدر الربط الوحيد المتاح حاليًا (سطحي ~0.3% من الطلبات):
+  link_source: "customerpointsearned"   # (reservationorderid -> usersid)
+  recent_orders_window: 20
+  repeatable_categories: []     # تصنيفات يُسمح بتكرار اقتراحها (مشروبات..) — تُملأ لاحقًا
+
+# --- منع الاقتراحات غير الصالحة ---
+serving:
+  exclude_items_in_cart: true       # لا نقترح صنف موجود بالسلة (إلا repeatable)
+  only_items_available_in_restaurant: true  # لا نقترح صنف غير موجود بمنيو المطعم
+  default_top_k: 5
+  recency_half_life_days: 120       # نصف عمر وزن الحداثة (recency_score)
+  # --- أمان تشغيلي (Phase: AI DoD) ---
+  enabled: true                     # تعطيل ناعم من config (يتطلب restart)
+  kill_switch_file: "artifacts/KILL_SWITCH"  # وجود الملف => تعطيل فوري بلا restart
+  # (أيضًا متغيّر البيئة AI_RECO_DISABLED=أي قيمة => تعطيل فوري)
+  require_api_key: false            # لو true: يتطلب رأس X-API-Key (القيمة من env API_KEY)
+  rate_limit_per_min: 120           # حد الطلبات/دقيقة لكل مفتاح/مصدر (0 = بلا حد)
+  max_cart_items: 50                # حد حجم السلة في الطلب
+  # عزل المستأجر: خريطة api_key -> قائمة restaurant_ids المسموح بها (فارغة = بلا تقييد)
+  tenant_allowed_restaurants: {}
+
+# --- Phase 10: تحسينات الجودة فوق الـ champion (كلها قابلة للتفعيل/التعطيل) ---
+phase10:
+  enabled: true
+  time_aware_popularity:        # إشارة صغيرة تُضاف لـ blend الـ cross_sell
+    enabled: true
+    weight: 0.10                # جُرّب 0.05 / 0.10 / 0.15 في ablation
+    min_bucket_orders: 300      # فترة أقل من هذا => fallback لشعبية المطعم
+  similar_alternatives:         # رِيل منفصل (لا يمسّ cross_sell)
+    enabled: true
+    top_k: 5
+    min_similarity: 0.05
+    model_name: "item2vec_ppmi_svd"
+  pooled_fbt_fallback:          # للمطاعم بلا FBT خاص (الصغيرة) فقط
+    enabled: true
+    only_when_no_own_fbt: true
+  dedup:
+    by_normalized_name: true
+    by_common_group: true
+  groups:
+    default_include_types: ["cross_sell", "similar_alternative", "popular"]
+    titles:
+      cross_sell: "يُطلب غالبًا معه"
+      similar_alternative: "بدائل مشابهة"
+      popular: "الأكثر طلبًا"
+      time_based: "مناسب لهذا الوقت"
+      global_common: "أصناف شائعة"
+
+# --- Phase 09: بحث وتجارب مودلات (لا يغيّر الإنتاج) ---
+phase09:
+  trials_cap_per_restaurant: 5000     # سقف تجارب الاختبار لكل مطعم (للسرعة) — مُسجّل في التقرير
+  min_pair_count: 10                  # نفس عتبة FBT
+  smoothed_alphas: [5, 10, 25, 50]    # Bayesian shrinkage للـ confidence
+  item2vec:
+    dim: 48
+    min_count: 5
+    topk: 20
+    min_orders_restaurant: 1000       # نبني embeddings فقط لمطاعم فيها داتا كافية
+  bundle:
+    min_support_count: 25
+    max_len: 3
+  trending:
+    windows: [[7, 7], [30, 30]]       # [recent_days, previous_days]
+  category_rerank_lambda: 0.5
+  pooled:
+    min_group_pair_count: 50          # أقل اقتران لزوج مجموعات (pooled)
+  time_buckets:                        # ساعة البدء (شامل) -> اسم الفترة
+    breakfast: [6, 11]
+    lunch: [11, 16]
+    afternoon: [16, 19]
+    dinner: [19, 25]                   # 19:00-01:00 (25 = 1ص اليوم التالي)
+    late_night: [1, 6]
+  min_bucket_orders: 300              # أقل طلبات لاعتبار شريحة (وقت/نوع) صالحة للتدريب
+
+# --- A/B testing (تعيين حتمي حسب مفتاح ثابت) ---
+ab_testing:
+  enabled: false                    # فعّلها لاحقًا بعد تجميع أحداث كافية
+  salt: "rec-exp-2026"
+  variants:                         # الاسم -> وزن التوزيع + استراتيجية الترتيب
+    control_popularity: {weight: 0.34, strategy: popularity}
+    fbt_confidence:     {weight: 0.33, strategy: fbt_confidence}
+    hybrid:             {weight: 0.33, strategy: hybrid}

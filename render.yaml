@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: bontech-menu-ai
+    runtime: docker
+    plan: free
+    autoDeploy: true
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      - key: PYTHONUTF8
+        value: "1"
+      - key: BONTECH_MODEL_FILE
+        value: /app/ToCoun/Final/bontech_recommendation_model_v1_1_0.joblib
+      - key: DB_HOST
+        sync: false
+      - key: DB_PORT
+        value: "5432"
+      - key: DB_NAME
+        sync: false
+      - key: DB_USER
+        sync: false
+      - key: DB_PASS
+        sync: false
+      - key: API_KEY
+        sync: false
