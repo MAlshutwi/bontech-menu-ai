@@ -20,6 +20,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from .config import MODEL_VERSION, SERVING
 from .model_loader import final_model_path, load_model
@@ -45,6 +46,8 @@ EVENTS_DIR.mkdir(parents=True, exist_ok=True)
 WIDGET_DIR = ROOT_DIR / "delivery" / "final_model" / "widget"
 FINAL_DELIVERY_DEMO = ROOT_DIR / "delivery" / "final_model" / "demo" / "index.html"
 LEGACY_FINAL_DELIVERY_DEMO = ROOT_DIR / "التسليم" / "ديمو" / "index.html"
+LOVABLE_MENU_DIST = ROOT_DIR / "ToCoun" / "LovableMenuAI" / "dist"
+LOVABLE_MENU_INDEX = LOVABLE_MENU_DIST / "index.html"
 
 
 @asynccontextmanager
@@ -66,6 +69,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="POS Recommendations API", version=MODEL_VERSION, lifespan=lifespan)
+if (LOVABLE_MENU_DIST / "assets").exists():
+    app.mount("/assets", StaticFiles(directory=LOVABLE_MENU_DIST / "assets"), name="lovable-menu-assets")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -322,6 +327,8 @@ def ai_demo():
 
 @app.get("/")
 def root_demo():
+    if LOVABLE_MENU_INDEX.exists():
+        return FileResponse(LOVABLE_MENU_INDEX, media_type="text/html")
     return RedirectResponse(url="/try", status_code=307)
 
 
