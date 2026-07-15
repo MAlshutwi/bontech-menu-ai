@@ -322,7 +322,7 @@ def ai_demo():
 
 @app.get("/")
 def root_demo():
-    return RedirectResponse(url="/demo/final-delivery", status_code=307)
+    return RedirectResponse(url="/try", status_code=307)
 
 
 @app.get("/try", response_class=HTMLResponse)
