@@ -2,11 +2,13 @@
 
 FastAPI recommendation service with a live PostgreSQL restaurant menu and a Lovable-ready React frontend.
 
+[![Deploy to Render](https://render.com/images/deploy-to-render-button.svg)](https://render.com/deploy?repo=https://github.com/MAlshutwi/bontech-menu-ai)
+
 ## Render
 
 This repository includes `render.yaml` and `Dockerfile`.
 
-Create a Render Blueprint from this repository and set these secrets:
+Render prompts for these secrets during Blueprint creation:
 
 - `DB_HOST`
 - `DB_NAME`
@@ -17,4 +19,7 @@ Create a Render Blueprint from this repository and set these secrets:
 The model is packaged at `ToCoun/Final/bontech_recommendation_model_v1_1_0.joblib`.
 
 Health endpoint: `/health`
+
 Live restaurant menu: `/api/menu/restaurants`
+
+Lovable frontend source: `ToCoun/LovableMenuAI`
