@@ -62,6 +62,7 @@ export function getRecommendationModels(
   restaurantId: number,
   cartItemIds: number[],
   lastAddedItemId: number | null,
+  previousTopItemId: number | null,
   signal?: AbortSignal,
 ): Promise<WidgetRecommendationResponse> {
   return postJson<WidgetRecommendationResponse>(
@@ -70,6 +71,7 @@ export function getRecommendationModels(
       restaurant_id: restaurantId,
       cart_item_ids: [...new Set(cartItemIds)],
       last_added_item_id: lastAddedItemId || undefined,
+      previous_top_item_id: previousTopItemId || undefined,
       // Fetch enough candidates for independent model rails after live
       // stock/category filtering. Each visible rail still shows at most five.
       limit: 30,

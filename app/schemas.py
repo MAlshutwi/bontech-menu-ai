@@ -62,6 +62,7 @@ class WidgetRecommendationRequest(BaseModel):
     restaurant_id: StrictInt = Field(..., ge=1)
     cart_item_ids: List[StrictInt]
     last_added_item_id: Optional[StrictInt] = Field(None, ge=1)
+    previous_top_item_id: Optional[StrictInt] = Field(None, ge=1)
     limit: StrictInt = Field(5, ge=1, le=50)
     context: Optional[Dict[str, Any]] = None
 

@@ -98,7 +98,7 @@ export default function App() {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [widgetPosition, setWidgetPosition] = useState<{ left: number; top: number } | null>(null);
   const [modelGroups, setModelGroups] = useState<WidgetRecommendationModelGroup[]>([]);
-  const [activeModelKey, setActiveModelKey] = useState<RecommendationModelKey>("ensemble");
+  const [activeModelKey, setActiveModelKey] = useState<RecommendationModelKey>("popularity");
   const [selectedRecommendationId, setSelectedRecommendationId] = useState<number | null>(null);
   const [recommendationError, setRecommendationError] = useState("");
   const [loadingRestaurants, setLoadingRestaurants] = useState(true);
@@ -113,6 +113,7 @@ export default function App() {
   const dragRef = useRef<{ pointerId: number; offsetX: number; offsetY: number } | null>(null);
   const activeRestaurantIdRef = useRef<number | null>(null);
   const activeCartSignatureRef = useRef("");
+  const lastVisibleRecommendationIdRef = useRef<number | null>(null);
 
   useEffect(() => {
     getRestaurants()
@@ -168,39 +169,48 @@ export default function App() {
     setLoadingRecommendation(true);
     setRecommendationError("");
     const controller = new AbortController();
+    const previousTopItemId = lastVisibleRecommendationIdRef.current;
     const timer = window.setTimeout(() => {
-      getRecommendationModels(restaurantId, cartItemIds, lastAddedItemId, controller.signal)
+      getRecommendationModels(
+        restaurantId,
+        cartItemIds,
+        lastAddedItemId,
+        previousTopItemId,
+        controller.signal,
+      )
         .then((response) => {
           if (controller.signal.aborted) return;
           const liveItems = new Map(menu.items.map((item) => [item.item_id, item]));
           const cartIds = new Set(cartItemIds);
-          const cartCategories = new Set(
-            cartItemIds
-              .map((itemId) => liveItems.get(itemId)?.category_id)
-              .filter((value): value is number => value != null),
-          );
           const responseGroups = response.models?.length
             ? response.models
             : [{
-                model_key: "ensemble" as const,
-                label_ar: "المزيج الذكي",
+                model_key: cartIds.size ? "ensemble" as const : "popularity" as const,
+                label_ar: cartIds.size ? "المزيج الذكي" : "الأكثر طلبًا",
                 description_ar: "أفضل الاقتراحات المتاحة",
                 available: Boolean(response.top_recommendations?.length),
                 threshold_fallback_used: Boolean(response.threshold_fallback_used),
                 suggestions: response.top_recommendations || [],
               }];
-          const validGroups = responseGroups.map((group) => {
+          const scopedGroups = cartIds.size
+            ? responseGroups.filter((group) => group.model_key !== "popularity")
+            : responseGroups.filter((group) => group.model_key === "popularity");
+          const validGroups = scopedGroups.map((group) => {
             const seen = new Set<number>();
             const suggestions = (group.suggestions || []).filter((item) => {
               const liveItem = liveItems.get(item.item_id);
               if (
                 seen.has(item.item_id)
+                || item.item_id === previousTopItemId
                 || !liveItem
                 || !liveItem.is_available
                 || item.addable === false
                 || cartIds.has(item.item_id)
               ) return false;
-              if (liveItem.category_id != null && cartCategories.has(liveItem.category_id)) return false;
+              if (
+                cartIds.size
+                && (item.model_key === "popularity" || item.recommendation_context === "popular")
+              ) return false;
               seen.add(item.item_id);
               return true;
             });
@@ -212,14 +222,11 @@ export default function App() {
             const preferred = validGroups.find(
               (group) => group.model_key === response.default_model_key && group.available,
             );
-            return preferred?.model_key || validGroups.find((group) => group.available)?.model_key || "ensemble";
+            return preferred?.model_key
+              || validGroups.find((group) => group.available)?.model_key
+              || (cartIds.size ? "ensemble" : "popularity");
           });
-          setSelectedRecommendationId((current) =>
-            current != null
-            && validGroups.some((group) => group.suggestions.some((item) => item.item_id === current))
-              ? current
-              : null,
-          );
+          setSelectedRecommendationId(null);
         })
         .catch((cause: unknown) => {
           if (cause instanceof DOMException && cause.name === "AbortError") return;
@@ -269,23 +276,36 @@ export default function App() {
     [cart],
   );
   const cartQuantity = useMemo(() => cart.reduce((total, line) => total + line.quantity, 0), [cart]);
+  const visibleModelGroups = useMemo(
+    () => (
+      cartItemIds.length
+        ? modelGroups.filter((group) => group.model_key !== "popularity")
+        : modelGroups.filter((group) => group.model_key === "popularity")
+    ),
+    [cartItemIds.length, modelGroups],
+  );
 
   const activeModelGroup = useMemo(
     () =>
-      modelGroups.find((group) => group.model_key === activeModelKey && group.available)
-      || modelGroups.find((group) => group.model_key === "ensemble" && group.available)
-      || modelGroups.find((group) => group.available)
+      visibleModelGroups.find((group) => group.model_key === activeModelKey && group.available)
+      || visibleModelGroups.find((group) => group.model_key === "ensemble" && group.available)
+      || visibleModelGroups.find((group) => group.available)
       || null,
-    [activeModelKey, modelGroups],
+    [activeModelKey, visibleModelGroups],
   );
   const recommendations = activeModelGroup?.suggestions || [];
-  const availableModelCount = modelGroups.filter(
+  const availableModelCount = visibleModelGroups.filter(
     (group) => group.available && group.model_key !== "ensemble",
   ).length;
   const recommendation = useMemo(
     () => recommendations.find((item) => item.item_id === selectedRecommendationId) || recommendations[0] || null,
     [recommendations, selectedRecommendationId],
   );
+  useEffect(() => {
+    if (recommendation?.item_id != null) {
+      lastVisibleRecommendationIdRef.current = recommendation.item_id;
+    }
+  }, [recommendation?.item_id]);
   const recommendationMenuItem = useMemo(
     () => menu?.items.find((item) => item.item_id === recommendation?.item_id) || null,
     [menu?.items, recommendation?.item_id],
@@ -302,13 +322,14 @@ export default function App() {
     setCart([]);
     setLastAddedItemId(null);
     setModelGroups([]);
-    setActiveModelKey("ensemble");
+    setActiveModelKey("popularity");
     setSelectedRecommendationId(null);
     setDetailsOpen(false);
     setRecommendationError("");
     setSearch("");
     setCategoryId("all");
     setMenu(null);
+    lastVisibleRecommendationIdRef.current = null;
     activeRestaurantIdRef.current = nextId;
     setRestaurantId(nextId);
     setNotice(hadCart ? "تم تغيير المطعم وتصفير السلة." : "تم تغيير المطعم.");
@@ -366,19 +387,28 @@ export default function App() {
     setCart([]);
     setLastAddedItemId(null);
     setModelGroups([]);
-    setActiveModelKey("ensemble");
+    setActiveModelKey("popularity");
     setSelectedRecommendationId(null);
     setDetailsOpen(false);
     setRecommendationError("");
   }
 
   function removeModelSuggestions(shouldRemove: (item: WidgetRecommendationItem) => boolean) {
-    setModelGroups((current) =>
-      current.map((group) => {
+    setModelGroups((current) => {
+      const next = current.map((group) => {
         const suggestions = group.suggestions.filter((item) => !shouldRemove(item));
         return { ...group, suggestions, available: suggestions.length > 0 };
-      }),
-    );
+      });
+      const nextVisibleGroup =
+        next.find((group) => group.model_key === activeModelKey && group.available)
+        || next.find((group) => group.model_key === "ensemble" && group.available)
+        || next.find((group) => group.available);
+      const nextVisibleItemId = nextVisibleGroup?.suggestions[0]?.item_id;
+      if (nextVisibleItemId != null) {
+        lastVisibleRecommendationIdRef.current = nextVisibleItemId;
+      }
+      return next;
+    });
     setActiveModelKey("ensemble");
     setSelectedRecommendationId(null);
   }
@@ -680,9 +710,9 @@ export default function App() {
           </header>
            <div className="widget-body">
              {recommendationError ? <div className="widget-inline-error">{recommendationError}</div> : null}
-             {modelGroups.length ? (
+             {visibleModelGroups.length > 1 ? (
                <nav className="model-filters" aria-label="فرز الاقتراحات حسب المحرك">
-                 {modelGroups.map((group) => (
+                 {visibleModelGroups.map((group) => (
                    <button
                      type="button"
                      key={group.model_key}

@@ -92,12 +92,16 @@ class BonTechRecommendationModel:
         cart_item_ids: list[int],
         last_added_item_id: int | None = None,
         limit: int = 5,
+        previous_top_item_id: int | None = None,
     ) -> dict[str, Any]:
         rid = int(restaurant_id)
         top_k = max(1, min(int(limit or 5), 50))
         cart_ids = _unique_positive_ints(cart_item_ids)
         cart_set = set(cart_ids)
         last_item = int(last_added_item_id) if last_added_item_id else None
+        previous_top = int(previous_top_item_id) if previous_top_item_id else None
+        excluded = {previous_top} if previous_top else set()
+        candidate_k = min(50, top_k + (1 if previous_top else 0))
         warnings: list[str] = []
         disabled_reason = None
 
@@ -116,7 +120,41 @@ class BonTechRecommendationModel:
         if last_item and last_item not in cart_set:
             warnings.append("last_added_item_id_not_in_cart_item_ids")
 
-        include = ["cross_sell", "similar_alternative", "popular"]
+        if not cart_ids:
+            popular_items = self.engine.popular(
+                rid,
+                top_k=candidate_k,
+                exclude=list(excluded),
+            )
+            popular_payload = {
+                "recommendation_groups": [{"type": "popular", "items": popular_items}],
+                "fallback_used": True,
+            }
+            sections["popular"], skipped = self._pick_group_items(
+                rid,
+                popular_payload,
+                cart_set,
+                set(),
+                ["popular"],
+                top_k,
+                excluded,
+            )
+            warnings.extend(skipped[:10])
+            top_recommendations = self._top_recommendations(sections, top_k, has_cart=False)
+            if previous_top and not top_recommendations:
+                warnings.append("no_alternative_after_rotation")
+            return self._response(
+                rid,
+                cart_ids,
+                last_item,
+                sections,
+                top_recommendations,
+                True,
+                disabled_reason,
+                warnings,
+            )
+
+        include = ["cross_sell", "similar_alternative"]
         context = {
             "source": "pos_widget",
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -126,9 +164,10 @@ class BonTechRecommendationModel:
             return self.engine.recommend_groups(
                 restaurant_id=rid,
                 cart_item_ids=ids,
-                top_k=top_k,
+                top_k=candidate_k,
                 include_types=include,
                 context=context,
+                cart_only=True,
             )
 
         last_payload = call_engine([last_item]) if last_item else {
@@ -136,28 +175,36 @@ class BonTechRecommendationModel:
             "fallback_used": True,
         }
         cart_payload = call_engine(cart_ids)
-        popular_items = self.engine.popular(rid, top_k=top_k, exclude=cart_ids)
-        popular_payload = {
-            "recommendation_groups": [{"type": "popular", "items": popular_items}],
-            "fallback_used": True,
-        }
-
         skipped_all: list[str] = []
         if last_item:
             sections["based_on_last_item"], skipped = self._pick_group_items(
-                rid, last_payload, cart_set, set(), ["cross_sell"], top_k
+                rid,
+                last_payload,
+                cart_set,
+                set(),
+                ["cross_sell"],
+                top_k,
+                excluded,
             )
             skipped_all.extend(skipped)
         sections["based_on_cart"], skipped = self._pick_group_items(
-            rid, cart_payload, cart_set, set(), ["cross_sell"], top_k
+            rid,
+            cart_payload,
+            cart_set,
+            set(),
+            ["cross_sell"],
+            top_k,
+            excluded,
         )
         skipped_all.extend(skipped)
         sections["similar_alternatives"], skipped = self._pick_group_items(
-            rid, cart_payload, cart_set, set(), ["similar_alternative"], top_k
-        )
-        skipped_all.extend(skipped)
-        sections["popular"], skipped = self._pick_group_items(
-            rid, popular_payload, cart_set, set(), ["popular"], top_k
+            rid,
+            cart_payload,
+            cart_set,
+            set(),
+            ["similar_alternative"],
+            top_k,
+            excluded,
         )
         skipped_all.extend(skipped)
 
@@ -165,7 +212,9 @@ class BonTechRecommendationModel:
             if reason not in warnings:
                 warnings.append(reason)
 
-        top_recommendations = self._top_recommendations(sections, top_k)
+        top_recommendations = self._top_recommendations(sections, top_k, has_cart=True)
+        if previous_top and not top_recommendations:
+            warnings.append("no_alternative_after_rotation")
         fallback_used = bool(
             last_payload.get("fallback_used")
             or cart_payload.get("fallback_used")
@@ -207,16 +256,21 @@ class BonTechRecommendationModel:
         seen: set[int],
         preferred_types: list[str],
         limit: int,
+        excluded_item_ids: set[int] | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         groups = {g.get("type"): g for g in payload.get("recommendation_groups", [])}
         out: list[dict[str, Any]] = []
         skipped: list[str] = []
+        excluded = excluded_item_ids or set()
         for recommendation_type in preferred_types:
             group = groups.get(recommendation_type)
             if not group:
                 continue
             for raw_item in group.get("items", []):
                 item_id = int(raw_item.get("item_id"))
+                if item_id in excluded:
+                    skipped.append(f"previous_top_excluded:{item_id}")
+                    continue
                 if item_id in seen:
                     skipped.append(f"duplicate_item:{item_id}")
                     continue
@@ -264,11 +318,17 @@ class BonTechRecommendationModel:
         self,
         sections: dict[str, list[dict[str, Any]]],
         limit: int,
+        has_cart: bool,
     ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         seen: set[int] = set()
         top_limit = min(2, max(1, int(limit)))
-        for section_name in ("based_on_last_item", "based_on_cart", "popular", "similar_alternatives"):
+        section_order = (
+            ("based_on_cart", "based_on_last_item", "similar_alternatives")
+            if has_cart
+            else ("popular",)
+        )
+        for section_name in section_order:
             for item in sections[section_name]:
                 item_id = int(item["item_id"])
                 if item_id in seen:

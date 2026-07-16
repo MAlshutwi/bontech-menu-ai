@@ -269,6 +269,10 @@ class Recommender:
         for ci in cart:
             g = self.item_group.get(ci)
             if g is None:
+                normalized_title = self.norm_title.get(ci)
+                if normalized_title:
+                    g = self.title_to_group.get(normalized_title)
+            if g is None:
                 continue
             for gb, conf in self.pooled.get(g, []):
                 loc = local.get(gb)
@@ -297,7 +301,15 @@ class Recommender:
             return cart
         return [item_id for item_id in cart if item_id in available]
 
-    def recommend(self, restaurant_id, cart_item_ids=None, customer_id=None, top_k=None, context=None):
+    def recommend(
+        self,
+        restaurant_id,
+        cart_item_ids=None,
+        customer_id=None,
+        top_k=None,
+        context=None,
+        cart_only=False,
+    ):
         rid = int(restaurant_id)
         top_k = int(top_k or SERVING.get("default_top_k", 5))
         requested_cart = [int(x) for x in (cart_item_ids or [])]
@@ -308,31 +320,44 @@ class Recommender:
         fbt_s, fbt_ev = self._fbt_scores(rid, cart)
         # Pooled fallback for low-data restaurants without restaurant-specific FBT.
         pooled_used = False
-        if not fbt_s and self.pooled_enabled and rid not in self.fbt:
+        if not fbt_s and self.pooled_enabled:
             ps = self._pooled_scores(rid, cart)
             if ps:
                 fbt_s, pooled_used = ps, True
-        pop_s = self._pop_scores(rid)
-        glob_s = self._global_scores(rid)
-        cust_s = self._customer_scores(customer_id, rid) if has_cust else {}
-        rec_s = self.recency.get(rid, {})
-        ta_s = self._time_aware_scores(rid, context)
-
-        cands = set(fbt_s) | set(pop_s) | set(glob_s) | set(cust_s) | set(ta_s)
+        if cart_only:
+            # Once a cart exists, rank cross-sell candidates only from cart
+            # co-occurrence. Popularity remains an empty-cart discovery signal,
+            # not a hidden influence on the cart recommendation.
+            pop_s = {}
+            glob_s = {}
+            cust_s = {}
+            rec_s = {}
+            ta_s = {}
+            cands = set(fbt_s)
+        else:
+            pop_s = self._pop_scores(rid)
+            glob_s = self._global_scores(rid)
+            cust_s = self._customer_scores(customer_id, rid) if has_cust else {}
+            rec_s = self.recency.get(rid, {})
+            ta_s = self._time_aware_scores(rid, context)
+            cands = set(fbt_s) | set(pop_s) | set(glob_s) | set(cust_s) | set(ta_s)
         scored = []
         for it in cands:
             if self.exclude_in_cart and it in cart and self.item_category.get(it) not in self.repeatable:
                 continue
             if self.only_available and avail and it not in avail:
                 continue
-            contrib = {
-                "restaurant_fbt": weights["restaurant_fbt"] * fbt_s.get(it, 0.0),
-                "restaurant_popularity": weights["restaurant_popularity"] * pop_s.get(it, 0.0),
-                "global_common": weights["global_common"] * glob_s.get(it, 0.0),
-                "customer_affinity": weights["customer_affinity"] * cust_s.get(it, 0.0),
-                "recency": weights["recency"] * rec_s.get(it, 0.0),
-                "time_based": self.wt * ta_s.get(it, 0.0),
-            }
+            if cart_only:
+                contrib = {"restaurant_fbt": fbt_s.get(it, 0.0)}
+            else:
+                contrib = {
+                    "restaurant_fbt": weights["restaurant_fbt"] * fbt_s.get(it, 0.0),
+                    "restaurant_popularity": weights["restaurant_popularity"] * pop_s.get(it, 0.0),
+                    "global_common": weights["global_common"] * glob_s.get(it, 0.0),
+                    "customer_affinity": weights["customer_affinity"] * cust_s.get(it, 0.0),
+                    "recency": weights["recency"] * rec_s.get(it, 0.0),
+                    "time_based": self.wt * ta_s.get(it, 0.0),
+                }
             total = sum(contrib.values())
             if total <= 0:
                 continue
@@ -358,7 +383,8 @@ class Recommender:
                 break
         if not recs:
             fallback_used = True
-            recs = self._fallback(rid, cart, top_k)
+            if not cart_only:
+                recs = self._fallback(rid, cart, top_k)
 
         return {
             "restaurant_id": rid,
@@ -617,8 +643,16 @@ class Recommender:
                 break
         return out
 
-    def recommend_groups(self, restaurant_id, cart_item_ids=None, customer_id=None,
-                         top_k=None, include_types=None, context=None):
+    def recommend_groups(
+        self,
+        restaurant_id,
+        cart_item_ids=None,
+        customer_id=None,
+        top_k=None,
+        include_types=None,
+        context=None,
+        cart_only=False,
+    ):
         """Return grouped rails while preserving legacy recommendations for compatibility."""
         rid = int(restaurant_id)
         top_k = int(top_k or SERVING.get("default_top_k", 5))
@@ -627,7 +661,14 @@ class Recommender:
         include = include_types or gcfg.get("default_include_types",
                                             ["cross_sell", "similar_alternative", "popular"])
         titles = gcfg.get("titles", {})
-        base = self.recommend(rid, cart, customer_id, top_k, context)
+        base = self.recommend(
+            rid,
+            cart,
+            customer_id,
+            top_k,
+            context,
+            cart_only=cart_only,
+        )
         groups = []
         for t in include:
             if t == "cross_sell":

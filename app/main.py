@@ -491,15 +491,20 @@ _CONTEXT_META = {
 _ENSEMBLE_META = {
     "model_key": "ensemble",
     "label_ar": "المزيج الذكي",
-    "description_ar": "يمزج أفضل النتائج من محركات السلة والارتباط والتشابه والطلب.",
+    "description_ar": "يرتب نتائج السلة والارتباط والتشابه مع أولوية لإجماع المحركات.",
 }
 
-_MODEL_CONTEXT_ORDER = [
+_CART_MODEL_CONTEXT_ORDER = [
     "based_on_cart",
     "based_on_last_item",
     "similar_alternatives",
-    "popular",
 ]
+
+_ENSEMBLE_CONTEXT_WEIGHTS = {
+    "based_on_cart": 1.00,
+    "based_on_last_item": 0.82,
+    "similar_alternatives": 0.62,
+}
 
 _MODEL_ALLOWED_SOURCES = {
     "based_on_cart": {"restaurant_fbt", "pooled_fbt"},
@@ -548,6 +553,11 @@ def _calibrated_match_score(context: str, raw_score: float, max_score: float, ra
     base_signal = 1.0 - math.exp(-safe_raw / scale)
     relative_signal = min(safe_raw / max_score, 1.0) if max_score > 0 else 0.0
     rank_signal = max(0.0, 1.0 - (max(0, int(rank)) / 4.0))
+    if context == "popular":
+        # Popularity is meaningful relative to the restaurant's own catalog.
+        # Present it as demand strength, not as a raw purchase probability.
+        calibrated = 0.58 + (0.34 * math.sqrt(relative_signal)) + (0.05 * rank_signal)
+        return float(round(max(1.0, min(calibrated * 100.0, 97.0))))
     calibrated = base_signal + (1.0 - base_signal) * (
         0.08 + 0.10 * relative_signal + 0.04 * rank_signal
     )
@@ -555,66 +565,107 @@ def _calibrated_match_score(context: str, raw_score: float, max_score: float, ra
 
 
 def _balanced_model_results(pools: dict, contexts: list[str], limit: int) -> list[dict]:
-    """Round-robin model results so one strategy cannot fill the entire rail."""
-    output = []
-    seen = set()
-    positions = {}
-    offsets = {context: 0 for context in contexts}
-    while len(output) < limit:
-        added = False
-        for context in contexts:
-            items = pools.get(context) or []
-            while offsets[context] < len(items):
-                item = items[offsets[context]]
-                offsets[context] += 1
-                item_id = int(item["item_id"])
-                if item_id in seen:
-                    existing_index = positions[item_id]
-                    if float(item.get("compatibility_percent") or 0.0) > float(
-                        output[existing_index].get("compatibility_percent") or 0.0
-                    ):
-                        output[existing_index] = item
-                    continue
-                seen.add(item_id)
-                positions[item_id] = len(output)
-                output.append(item)
-                added = True
-                break
-            if len(output) >= limit:
-                break
-        if not added:
-            break
+    """Blend cart models with full-cart priority and an agreement bonus."""
+    candidates = {}
     priority_index = {context: index for index, context in enumerate(contexts)}
-    output.sort(key=lambda item: (
-        -float(item.get("compatibility_percent") or 0.0),
-        priority_index.get(item.get("recommendation_context"), len(contexts)),
-        int(item.get("rank") or 1),
-        int(item["item_id"]),
-    ))
-    return output
+    for context in contexts:
+        items = pools.get(context) or []
+        context_weight = _ENSEMBLE_CONTEXT_WEIGHTS.get(context, 0.5)
+        item_count = max(1, len(items))
+        for item in items:
+            item_id = int(item["item_id"])
+            rank = max(1, int(item.get("rank") or 1))
+            compatibility = float(item.get("compatibility_percent") or 0.0) / 100.0
+            rank_signal = max(0.0, 1.0 - ((rank - 1) / item_count))
+            weighted_signal = min(
+                0.97,
+                context_weight * ((0.85 * compatibility) + (0.15 * rank_signal)),
+            )
+            current = candidates.get(item_id)
+            if current is None:
+                candidates[item_id] = {
+                    "representative": item,
+                    "miss_probability": 1.0 - weighted_signal,
+                    "contexts": {context},
+                    "has_strong_signal": bool(item.get("meets_threshold")),
+                }
+                continue
+            current["miss_probability"] *= 1.0 - weighted_signal
+            current["contexts"].add(context)
+            current["has_strong_signal"] = (
+                current["has_strong_signal"] or bool(item.get("meets_threshold"))
+            )
+            current_context = current["representative"].get("recommendation_context")
+            if priority_index.get(context, 99) < priority_index.get(current_context, 99):
+                current["representative"] = item
+
+    ranked = []
+    for item_id, candidate in candidates.items():
+        contexts_count = len(candidate["contexts"])
+        combined_score = 1.0 - candidate["miss_probability"]
+        if candidate["has_strong_signal"]:
+            compatibility_percent = round(70.0 + (27.0 * combined_score))
+        else:
+            compatibility_percent = min(69, round(combined_score * 100.0))
+        compatibility_percent = max(1, min(97, compatibility_percent))
+        meets_threshold = compatibility_percent >= 70
+        representative = {
+            **candidate["representative"],
+            "model_agreement_count": contexts_count,
+            "compatibility_percent": float(compatibility_percent),
+            "confidence_band_ar": _confidence_band_ar(compatibility_percent),
+            "meets_threshold": meets_threshold,
+        }
+        ranked.append((
+            combined_score,
+            priority_index.get(representative.get("recommendation_context"), len(contexts)),
+            int(representative.get("rank") or 1),
+            item_id,
+            representative,
+        ))
+    ranked.sort(key=lambda row: (-row[0], row[1], row[2], row[3]))
+    return [row[4] for row in ranked[:limit]]
 
 
-def _apply_live_recommendation_rules(result: dict, live_menu: dict, cart_item_ids, display_limit: int = 5):
+def _apply_live_recommendation_rules(
+    result: dict,
+    live_menu: dict,
+    cart_item_ids,
+    last_added_item_id=None,
+    previous_top_item_id=None,
+    display_limit: int = 5,
+):
     live_items = {int(item["item_id"]): item for item in live_menu["items"]}
-    cart_ids = set(_unique_positive_ints(cart_item_ids))
-    cart_categories = {
-        live_items[item_id].get("category_id")
-        for item_id in cart_ids
-        if item_id in live_items and live_items[item_id].get("category_id") is not None
-    }
+    cart_list = _unique_positive_ints(cart_item_ids)
+    cart_ids = set(cart_list)
+    has_cart = bool(cart_ids)
+    last_item_id = int(last_added_item_id) if last_added_item_id else None
+    if last_item_id not in cart_ids:
+        last_item_id = cart_list[-1] if cart_list else None
+    blocked_category_id = (
+        live_items.get(last_item_id, {}).get("category_id")
+        if last_item_id is not None
+        else None
+    )
+    previous_top = int(previous_top_item_id) if previous_top_item_id else None
     pools = {key: [] for key in _CONTEXT_META}
     pool_seen = {key: set() for key in _CONTEXT_META}
     skipped = {
+        "previous_top_excluded": 0,
         "not_live": 0,
         "out_of_stock": 0,
         "already_in_cart": 0,
-        "same_category_as_cart": 0,
+        "same_category_as_last_item": 0,
+        "popular_after_cart": 0,
         "model_source_mismatch": 0,
     }
 
     for section_name, section_items in (result.get("sections") or {}).items():
         for raw_item in section_items or []:
             item_id = int(raw_item["item_id"])
+            if previous_top is not None and item_id == previous_top:
+                skipped["previous_top_excluded"] += 1
+                continue
             live_item = live_items.get(item_id)
             if live_item is None:
                 skipped["not_live"] += 1
@@ -625,12 +676,20 @@ def _apply_live_recommendation_rules(result: dict, live_menu: dict, cart_item_id
             if item_id in cart_ids:
                 skipped["already_in_cart"] += 1
                 continue
-            category_id = live_item.get("category_id")
-            if category_id is not None and category_id in cart_categories:
-                skipped["same_category_as_cart"] += 1
-                continue
 
             context = _recommendation_context(section_name, raw_item)
+            if has_cart and context == "popular":
+                skipped["popular_after_cart"] += 1
+                continue
+            category_id = live_item.get("category_id")
+            if (
+                has_cart
+                and blocked_category_id is not None
+                and category_id == blocked_category_id
+            ):
+                skipped["same_category_as_last_item"] += 1
+                continue
+
             source = str(raw_item.get("source") or "").lower()
             if source not in _MODEL_ALLOWED_SOURCES[context]:
                 skipped["model_source_mismatch"] += 1
@@ -652,9 +711,11 @@ def _apply_live_recommendation_rules(result: dict, live_menu: dict, cart_item_id
                 "availability_reason": live_item.get("availability_reason"),
             })
 
-    if not cart_ids:
+    if not has_cart:
         for context in ("based_on_cart", "based_on_last_item", "similar_alternatives"):
             pools[context] = []
+    else:
+        pools["popular"] = []
 
     for context, items in pools.items():
         items.sort(key=lambda item: (-float(item.get("score") or 0.0), int(item["item_id"])))
@@ -670,8 +731,7 @@ def _apply_live_recommendation_rules(result: dict, live_menu: dict, cart_item_id
             # calibrator, so do not present these values as purchase probabilities.
             item["probability_percent"] = None
 
-    has_cart = bool(cart_ids)
-    priority = _MODEL_CONTEXT_ORDER if has_cart else ["popular"]
+    priority = _CART_MODEL_CONTEXT_ORDER if has_cart else ["popular"]
     max_results = max(1, min(int(display_limit or 5), 5))
     visible_pools = {}
     strong_pools = {}
@@ -692,28 +752,62 @@ def _apply_live_recommendation_rules(result: dict, live_menu: dict, cart_item_id
             item["model_agreement_count"] = agreement_counts.get(int(item["item_id"]), 1)
 
     has_strong_recommendations = any(strong_pools[context] for context in priority)
-    ensemble_pools = strong_pools if has_strong_recommendations else visible_pools
-    top_recommendations = _balanced_model_results(ensemble_pools, priority, max_results)
+    if has_strong_recommendations:
+        strong_item_ids = {
+            int(item["item_id"])
+            for context in priority
+            for item in strong_pools[context]
+        }
+        # Keep weaker corroborating signals for an otherwise strong candidate,
+        # while preventing weak-only candidates from polluting the ensemble.
+        ensemble_pools = {
+            context: [
+                item
+                for item in visible_pools[context]
+                if int(item["item_id"]) in strong_item_ids
+            ]
+            for context in priority
+        }
+    else:
+        ensemble_pools = visible_pools
+    top_recommendations = (
+        _balanced_model_results(ensemble_pools, priority, max_results)
+        if has_cart
+        else list(ensemble_pools["popular"][:max_results])
+    )
     threshold_fallback_used = bool(top_recommendations and not has_strong_recommendations)
 
-    models = [{
-        **_ENSEMBLE_META,
-        "available": bool(top_recommendations),
-        "description_ar": _ENSEMBLE_META["description_ar"],
-        "threshold_fallback_used": threshold_fallback_used,
-        "suggestions": top_recommendations,
-    }]
-    for context in _MODEL_CONTEXT_ORDER:
-        meta = _CONTEXT_META[context]
-        suggestions = visible_pools[context]
-        models.append({
-            "model_key": meta["model_key"],
-            "label_ar": meta["label_ar"],
-            "description_ar": meta["description_ar"],
-            "available": bool(suggestions),
-            "threshold_fallback_used": model_fallbacks[context],
-            "suggestions": suggestions,
-        })
+    if has_cart:
+        models = [{
+            **_ENSEMBLE_META,
+            "available": bool(top_recommendations),
+            "description_ar": _ENSEMBLE_META["description_ar"],
+            "threshold_fallback_used": threshold_fallback_used,
+            "suggestions": top_recommendations,
+        }]
+        for context in _CART_MODEL_CONTEXT_ORDER:
+            meta = _CONTEXT_META[context]
+            suggestions = visible_pools[context]
+            models.append({
+                "model_key": meta["model_key"],
+                "label_ar": meta["label_ar"],
+                "description_ar": meta["description_ar"],
+                "available": bool(suggestions),
+                "threshold_fallback_used": model_fallbacks[context],
+                "suggestions": suggestions,
+            })
+        default_model_key = "ensemble"
+    else:
+        popular_meta = _CONTEXT_META["popular"]
+        models = [{
+            "model_key": popular_meta["model_key"],
+            "label_ar": popular_meta["label_ar"],
+            "description_ar": popular_meta["description_ar"],
+            "available": bool(top_recommendations),
+            "threshold_fallback_used": threshold_fallback_used,
+            "suggestions": top_recommendations,
+        }]
+        default_model_key = "popularity"
 
     warnings = list(result.get("warnings") or [])
     for reason, count in skipped.items():
@@ -723,11 +817,13 @@ def _apply_live_recommendation_rules(result: dict, live_menu: dict, cart_item_id
         warnings.append("priority_model_below_70_showing_best_available")
     if not top_recommendations:
         warnings.append("no_eligible_live_recommendations")
+        if previous_top is not None:
+            warnings.append("no_alternative_after_rotation")
 
     result["sections"] = pools
     result["top_recommendations"] = top_recommendations
     result["models"] = models
-    result["default_model_key"] = "ensemble"
+    result["default_model_key"] = default_model_key
     result["available_model_keys"] = [
         model["model_key"] for model in models if model["available"]
     ]
@@ -749,6 +845,7 @@ def _build_widget_recommendations(req: WidgetRecommendationRequest, request: Req
         cart_item_ids=list(req.cart_item_ids),
         last_added_item_id=req.last_added_item_id,
         limit=req.limit,
+        previous_top_item_id=req.previous_top_item_id,
     )
     if result.get("disabled_reason"):
         result["threshold_percent"] = 70.0
@@ -766,6 +863,8 @@ def _build_widget_recommendations(req: WidgetRecommendationRequest, request: Req
             result,
             live_menu,
             req.cart_item_ids,
+            last_added_item_id=req.last_added_item_id,
+            previous_top_item_id=req.previous_top_item_id,
             display_limit=req.limit,
         )
     latency_ms = round(1000 * (time.perf_counter() - t0), 2)
