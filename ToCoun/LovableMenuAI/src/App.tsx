@@ -17,7 +17,7 @@ import type {
   WidgetRecommendationModelGroup,
 } from "./types/menu";
 
-const DEFAULT_RESTAURANT_ID = 277;
+const DEFAULT_RESTAURANT_ID = 192;
 const QUICK_RESTAURANT_IDS = [260, 192];
 type RecommendationModelKey = WidgetRecommendationModelGroup["model_key"];
 
