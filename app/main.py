@@ -323,25 +323,144 @@ def _live_menu_payload(restaurant_id: int, include_inactive: bool = False):
 
 
 _CONTEXT_META = {
-    "popular": ("الأكثر مبيعًا", "popular"),
-    "based_on_cart": ("بناءً على السلة كاملة", "cross_sell"),
-    "based_on_last_item": ("بناءً على آخر صنف", "cross_sell"),
-    "similar_alternatives": ("صنف مشابه", "similar_alternative"),
+    "based_on_cart": {
+        "model_key": "full_cart",
+        "label_ar": "السلة كاملة",
+        "description_ar": "يربط جميع أصناف السلة معًا ويقترح ما يُطلب معها.",
+        "score_label_ar": "قوة السلة",
+        "business_type": "cross_sell",
+        "score_scale": 0.30,
+    },
+    "based_on_last_item": {
+        "model_key": "last_item",
+        "label_ar": "آخر صنف",
+        "description_ar": "يركز على الارتباط مع آخر صنف تمت إضافته.",
+        "score_label_ar": "قوة الارتباط",
+        "business_type": "cross_sell",
+        "score_scale": 0.35,
+    },
+    "similar_alternatives": {
+        "model_key": "similarity",
+        "label_ar": "التشابه",
+        "description_ar": "يستخدم تشابه سلوك الطلبات لاكتشاف خيارات مناسبة.",
+        "score_label_ar": "درجة التشابه",
+        "business_type": "similar_alternative",
+        "score_scale": 0.35,
+    },
+    "popular": {
+        "model_key": "popularity",
+        "label_ar": "الأكثر طلبًا",
+        "description_ar": "يرتب الأصناف الأكثر طلبًا في المطعم.",
+        "score_label_ar": "قوة الطلب",
+        "business_type": "popular",
+        "score_scale": 0.25,
+    },
+}
+
+_ENSEMBLE_META = {
+    "model_key": "ensemble",
+    "label_ar": "المزيج الذكي",
+    "description_ar": "يمزج أفضل النتائج من محركات السلة والارتباط والتشابه والطلب.",
+}
+
+_MODEL_CONTEXT_ORDER = [
+    "based_on_cart",
+    "based_on_last_item",
+    "similar_alternatives",
+    "popular",
+]
+
+_MODEL_ALLOWED_SOURCES = {
+    "based_on_cart": {"restaurant_fbt", "pooled_fbt"},
+    "based_on_last_item": {"restaurant_fbt", "pooled_fbt"},
+    "similar_alternatives": {"item2vec"},
+    "popular": {"restaurant_popularity", "global_common"},
 }
 
 
 def _recommendation_context(section_name: str, item: dict) -> str:
+    # Section identity represents the strategy that generated the candidate.
+    # ``source`` is supporting evidence and must not move an item to another model.
+    if section_name in _CONTEXT_META:
+        return section_name
     source = str(item.get("source") or "").lower()
     recommendation_type = str(item.get("recommendation_type") or "").lower()
     if source in {"restaurant_popularity", "global_common"} or recommendation_type == "popular":
         return "popular"
     if source == "item2vec" or recommendation_type == "similar_alternative":
         return "similar_alternatives"
-    if section_name == "based_on_last_item":
-        return "based_on_last_item"
-    if section_name == "based_on_cart":
-        return "based_on_cart"
-    return section_name if section_name in _CONTEXT_META else "popular"
+    return "popular"
+
+
+def _confidence_band_ar(percent: float) -> str:
+    if percent >= 90:
+        return "مطابقة ممتازة"
+    if percent >= 80:
+        return "مطابقة قوية"
+    if percent >= 70:
+        return "مناسبة جدًا"
+    if percent >= 55:
+        return "مناسبة"
+    return "استكشافي"
+
+
+def _calibrated_match_score(context: str, raw_score: float, max_score: float, rank: int) -> float:
+    """Map heterogeneous ranking scores to a stable, bounded display score.
+
+    This is deliberately called a match score rather than purchase probability.
+    Each strategy has its own score scale; the transform is monotonic, capped at
+    97%, and keeps a weak pool below the 70% recommendation threshold.
+    """
+    meta = _CONTEXT_META[context]
+    safe_raw = max(0.0, float(raw_score or 0.0))
+    scale = float(meta["score_scale"])
+    base_signal = 1.0 - math.exp(-safe_raw / scale)
+    relative_signal = min(safe_raw / max_score, 1.0) if max_score > 0 else 0.0
+    rank_signal = max(0.0, 1.0 - (max(0, int(rank)) / 4.0))
+    calibrated = base_signal + (1.0 - base_signal) * (
+        0.08 + 0.10 * relative_signal + 0.04 * rank_signal
+    )
+    return float(round(max(1.0, min(calibrated * 100.0, 97.0))))
+
+
+def _balanced_model_results(pools: dict, contexts: list[str], limit: int) -> list[dict]:
+    """Round-robin model results so one strategy cannot fill the entire rail."""
+    output = []
+    seen = set()
+    positions = {}
+    offsets = {context: 0 for context in contexts}
+    while len(output) < limit:
+        added = False
+        for context in contexts:
+            items = pools.get(context) or []
+            while offsets[context] < len(items):
+                item = items[offsets[context]]
+                offsets[context] += 1
+                item_id = int(item["item_id"])
+                if item_id in seen:
+                    existing_index = positions[item_id]
+                    if float(item.get("compatibility_percent") or 0.0) > float(
+                        output[existing_index].get("compatibility_percent") or 0.0
+                    ):
+                        output[existing_index] = item
+                    continue
+                seen.add(item_id)
+                positions[item_id] = len(output)
+                output.append(item)
+                added = True
+                break
+            if len(output) >= limit:
+                break
+        if not added:
+            break
+    priority_index = {context: index for index, context in enumerate(contexts)}
+    output.sort(key=lambda item: (
+        -float(item.get("compatibility_percent") or 0.0),
+        priority_index.get(item.get("recommendation_context"), len(contexts)),
+        int(item.get("rank") or 1),
+        int(item["item_id"]),
+    ))
+    return output
 
 
 def _apply_live_recommendation_rules(result: dict, live_menu: dict, cart_item_ids, display_limit: int = 5):
@@ -359,6 +478,7 @@ def _apply_live_recommendation_rules(result: dict, live_menu: dict, cart_item_id
         "out_of_stock": 0,
         "already_in_cart": 0,
         "same_category_as_cart": 0,
+        "model_source_mismatch": 0,
     }
 
     for section_name, section_items in (result.get("sections") or {}).items():
@@ -380,74 +500,106 @@ def _apply_live_recommendation_rules(result: dict, live_menu: dict, cart_item_id
                 continue
 
             context = _recommendation_context(section_name, raw_item)
+            source = str(raw_item.get("source") or "").lower()
+            if source not in _MODEL_ALLOWED_SOURCES[context]:
+                skipped["model_source_mismatch"] += 1
+                continue
             if item_id in pool_seen[context]:
                 continue
             pool_seen[context].add(item_id)
-            type_label_ar, business_type = _CONTEXT_META[context]
+            meta = _CONTEXT_META[context]
             pools[context].append({
                 **raw_item,
                 "category_id": category_id,
                 "recommendation_context": context,
-                "recommendation_type": business_type,
-                "type_label_ar": type_label_ar,
+                "recommendation_type": meta["business_type"],
+                "type_label_ar": meta["label_ar"],
+                "model_key": meta["model_key"],
+                "model_label_ar": meta["label_ar"],
+                "score_label_ar": meta["score_label_ar"],
                 "is_available": True,
                 "availability_reason": live_item.get("availability_reason"),
             })
 
+    if not cart_ids:
+        for context in ("based_on_cart", "based_on_last_item", "similar_alternatives"):
+            pools[context] = []
+
     for context, items in pools.items():
         items.sort(key=lambda item: (-float(item.get("score") or 0.0), int(item["item_id"])))
-        safe_scores = [max(0.0, min(float(item.get("score") or 0.0), 1.0)) for item in items]
+        safe_scores = [max(0.0, float(item.get("score") or 0.0)) for item in items]
         max_score = max(safe_scores, default=0.0)
-        for item, raw_score in zip(items, safe_scores):
-            relative_score = raw_score / max_score if max_score > 0 else 0.0
-            compatibility = round((0.5 * raw_score + 0.5 * relative_score) * 100, 1)
+        for rank, (item, raw_score) in enumerate(zip(items, safe_scores), start=1):
+            compatibility = _calibrated_match_score(context, raw_score, max_score, rank - 1)
+            item["rank"] = rank
             item["compatibility_percent"] = compatibility
             item["meets_threshold"] = compatibility >= 70.0
+            item["confidence_band_ar"] = _confidence_band_ar(compatibility)
+            # The packaged artifact has ranking scores but no temporal probability
+            # calibrator, so do not present these values as purchase probabilities.
+            item["probability_percent"] = None
 
     has_cart = bool(cart_ids)
-    priority = (
-        ["based_on_cart", "based_on_last_item", "popular", "similar_alternatives"]
-        if has_cart
-        else ["popular"]
-    )
-    ranked = []
-    seen = set()
-    for context in priority:
-        for item in pools[context]:
-            item_id = int(item["item_id"])
-            if item_id in seen:
-                continue
-            seen.add(item_id)
-            ranked.append(item)
-
+    priority = _MODEL_CONTEXT_ORDER if has_cart else ["popular"]
     max_results = max(1, min(int(display_limit or 5), 5))
-    primary = next(
-        (pools[context][0] for context in priority if pools[context]),
-        None,
-    )
-    qualified = [item for item in ranked if item["meets_threshold"]]
-    threshold_fallback_used = bool(primary and not primary["meets_threshold"])
-    top_recommendations = (
-        ranked[:max_results]
-        if threshold_fallback_used
-        else qualified[:max_results]
-    )
+    visible_pools = {}
+    strong_pools = {}
+    model_fallbacks = {}
+    for context, items in pools.items():
+        strong = [item for item in items if item["meets_threshold"]]
+        strong_pools[context] = strong[:max_results]
+        model_fallbacks[context] = bool(items and not strong)
+        visible_pools[context] = (strong or items)[:max_results]
+
+    agreement_counts = {}
+    for context in priority:
+        for item in visible_pools[context]:
+            item_id = int(item["item_id"])
+            agreement_counts[item_id] = agreement_counts.get(item_id, 0) + 1
+    for items in pools.values():
+        for item in items:
+            item["model_agreement_count"] = agreement_counts.get(int(item["item_id"]), 1)
+
+    has_strong_recommendations = any(strong_pools[context] for context in priority)
+    ensemble_pools = strong_pools if has_strong_recommendations else visible_pools
+    top_recommendations = _balanced_model_results(ensemble_pools, priority, max_results)
+    threshold_fallback_used = bool(top_recommendations and not has_strong_recommendations)
+
+    models = [{
+        **_ENSEMBLE_META,
+        "available": bool(top_recommendations),
+        "description_ar": _ENSEMBLE_META["description_ar"],
+        "threshold_fallback_used": threshold_fallback_used,
+        "suggestions": top_recommendations,
+    }]
+    for context in _MODEL_CONTEXT_ORDER:
+        meta = _CONTEXT_META[context]
+        suggestions = visible_pools[context]
+        models.append({
+            "model_key": meta["model_key"],
+            "label_ar": meta["label_ar"],
+            "description_ar": meta["description_ar"],
+            "available": bool(suggestions),
+            "threshold_fallback_used": model_fallbacks[context],
+            "suggestions": suggestions,
+        })
 
     warnings = list(result.get("warnings") or [])
     for reason, count in skipped.items():
         if count:
             warnings.append(f"{reason}:{count}")
     if threshold_fallback_used:
-        warnings.append(
-            "priority_primary_below_70_showing_top_ranked"
-            if qualified
-            else "no_recommendations_above_70_showing_top_ranked"
-        )
+        warnings.append("priority_model_below_70_showing_best_available")
     if not top_recommendations:
         warnings.append("no_eligible_live_recommendations")
 
     result["sections"] = pools
     result["top_recommendations"] = top_recommendations
+    result["models"] = models
+    result["default_model_key"] = "ensemble"
+    result["available_model_keys"] = [
+        model["model_key"] for model in models if model["available"]
+    ]
     result["warnings"] = warnings
     result["threshold_percent"] = 70.0
     result["threshold_fallback_used"] = threshold_fallback_used

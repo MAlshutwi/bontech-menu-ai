@@ -78,10 +78,26 @@ export interface WidgetRecommendationItem {
   category_id: number | null;
   recommendation_context: "popular" | "based_on_cart" | "based_on_last_item" | "similar_alternatives";
   type_label_ar: string;
+  model_key: "full_cart" | "last_item" | "similarity" | "popularity";
+  model_label_ar: string;
+  score_label_ar: string;
+  rank: number;
   compatibility_percent: number;
+  probability_percent: number | null;
+  confidence_band_ar: string;
+  model_agreement_count: number;
   meets_threshold: boolean;
   is_available: boolean;
   availability_reason: string | null;
+}
+
+export interface WidgetRecommendationModelGroup {
+  model_key: "ensemble" | "full_cart" | "last_item" | "similarity" | "popularity";
+  label_ar: string;
+  description_ar: string;
+  available: boolean;
+  threshold_fallback_used: boolean;
+  suggestions: WidgetRecommendationItem[];
 }
 
 export interface WidgetRecommendationResponse {
@@ -99,6 +115,9 @@ export interface WidgetRecommendationResponse {
     popular: WidgetRecommendationItem[];
   };
   top_recommendations: WidgetRecommendationItem[];
+  models: WidgetRecommendationModelGroup[];
+  default_model_key: WidgetRecommendationModelGroup["model_key"];
+  available_model_keys: WidgetRecommendationModelGroup["model_key"][];
   warnings: string[];
   disabled_reason: string | null;
   threshold_percent: number;

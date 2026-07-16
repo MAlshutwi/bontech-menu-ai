@@ -37,7 +37,7 @@ export function getRestaurantMenu(restaurantId: number, includeInactive: boolean
   );
 }
 
-export function getOneRecommendation(
+export function getRecommendationModels(
   restaurantId: number,
   cartItemIds: number[],
   lastAddedItemId: number | null,
@@ -49,8 +49,8 @@ export function getOneRecommendation(
       restaurant_id: restaurantId,
       cart_item_ids: [...new Set(cartItemIds)],
       last_added_item_id: lastAddedItemId || undefined,
-      // Fetch enough candidates for live stock/category filtering while the widget
-      // still renders one primary suggestion and at most five details.
+      // Fetch enough candidates for independent model rails after live
+      // stock/category filtering. Each visible rail still shows at most five.
       limit: 30,
       context: { source: "lovable_menu_widget", channel: "web", locale: "ar" },
     },

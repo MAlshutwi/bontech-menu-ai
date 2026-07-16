@@ -87,8 +87,15 @@ class WidgetRecommendationItem(BaseModel):
     disabled_reason: Optional[str] = None
     category_id: Optional[int] = None
     recommendation_context: str = "popular"
-    type_label_ar: str = "الأكثر مبيعًا"
+    type_label_ar: str = "الأكثر طلبًا"
+    model_key: str = "popularity"
+    model_label_ar: str = "الأكثر طلبًا"
+    score_label_ar: str = "قوة الطلب"
+    rank: int = Field(1, ge=1)
     compatibility_percent: float = Field(0.0, ge=0.0, le=100.0)
+    probability_percent: Optional[float] = Field(None, ge=0.0, le=100.0)
+    confidence_band_ar: str = "استكشافي"
+    model_agreement_count: int = Field(1, ge=1)
     meets_threshold: bool = False
     is_available: bool = True
     availability_reason: Optional[str] = None
@@ -101,6 +108,15 @@ class WidgetRecommendationSections(BaseModel):
     popular: List[WidgetRecommendationItem] = Field(default_factory=list)
 
 
+class WidgetRecommendationModelGroup(BaseModel):
+    model_key: str
+    label_ar: str
+    description_ar: str = ""
+    available: bool = False
+    threshold_fallback_used: bool = False
+    suggestions: List[WidgetRecommendationItem] = Field(default_factory=list)
+
+
 class WidgetRecommendationResponse(BaseModel):
     request_id: str
     model_version: str
@@ -111,6 +127,9 @@ class WidgetRecommendationResponse(BaseModel):
     latency_ms: float
     sections: WidgetRecommendationSections
     top_recommendations: List[WidgetRecommendationItem] = Field(default_factory=list)
+    models: List[WidgetRecommendationModelGroup] = Field(default_factory=list)
+    default_model_key: str = "ensemble"
+    available_model_keys: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
     disabled_reason: Optional[str] = None
     threshold_percent: float = 70.0

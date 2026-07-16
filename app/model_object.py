@@ -142,23 +142,22 @@ class BonTechRecommendationModel:
             "fallback_used": True,
         }
 
-        seen: set[int] = set()
         skipped_all: list[str] = []
         if last_item:
             sections["based_on_last_item"], skipped = self._pick_group_items(
-                rid, last_payload, cart_set, seen, ["cross_sell", "popular", "similar_alternative"], top_k
+                rid, last_payload, cart_set, set(), ["cross_sell"], top_k
             )
             skipped_all.extend(skipped)
         sections["based_on_cart"], skipped = self._pick_group_items(
-            rid, cart_payload, cart_set, seen, ["cross_sell", "popular", "similar_alternative"], top_k
+            rid, cart_payload, cart_set, set(), ["cross_sell"], top_k
         )
         skipped_all.extend(skipped)
         sections["similar_alternatives"], skipped = self._pick_group_items(
-            rid, cart_payload, cart_set, seen, ["similar_alternative"], top_k
+            rid, cart_payload, cart_set, set(), ["similar_alternative"], top_k
         )
         skipped_all.extend(skipped)
         sections["popular"], skipped = self._pick_group_items(
-            rid, popular_payload, cart_set, seen, ["popular"], top_k
+            rid, popular_payload, cart_set, set(), ["popular"], top_k
         )
         skipped_all.extend(skipped)
 

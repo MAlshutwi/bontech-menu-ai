@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
-import { getOneRecommendation, getRestaurantMenu, getRestaurants } from "./lib/menuApi";
+import { getRecommendationModels, getRestaurantMenu, getRestaurants } from "./lib/menuApi";
 import type {
   CartLine,
   MenuItem,
@@ -8,10 +8,12 @@ import type {
   Restaurant,
   RestaurantMenuResponse,
   WidgetRecommendationItem,
+  WidgetRecommendationModelGroup,
 } from "./types/menu";
 
 const DEFAULT_RESTAURANT_ID = 277;
 const QUICK_RESTAURANT_IDS = [260, 192];
+type RecommendationModelKey = WidgetRecommendationModelGroup["model_key"];
 
 const restaurantName = (restaurant: Restaurant) =>
   restaurant.name_ar || restaurant.name || `مطعم #${restaurant.restaurant_id}`;
@@ -59,9 +61,9 @@ export default function App() {
   const [widgetOpen, setWidgetOpen] = useState(true);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [widgetPosition, setWidgetPosition] = useState<{ left: number; top: number } | null>(null);
-  const [recommendations, setRecommendations] = useState<WidgetRecommendationItem[]>([]);
+  const [modelGroups, setModelGroups] = useState<WidgetRecommendationModelGroup[]>([]);
+  const [activeModelKey, setActiveModelKey] = useState<RecommendationModelKey>("ensemble");
   const [selectedRecommendationId, setSelectedRecommendationId] = useState<number | null>(null);
-  const [thresholdFallbackUsed, setThresholdFallbackUsed] = useState(false);
   const [recommendationError, setRecommendationError] = useState("");
   const [loadingRestaurants, setLoadingRestaurants] = useState(true);
   const [loadingMenu, setLoadingMenu] = useState(false);
@@ -74,6 +76,7 @@ export default function App() {
   const widgetRef = useRef<HTMLElement>(null);
   const dragRef = useRef<{ pointerId: number; offsetX: number; offsetY: number } | null>(null);
   const activeRestaurantIdRef = useRef<number | null>(null);
+  const activeCartSignatureRef = useRef("");
 
   useEffect(() => {
     getRestaurants()
@@ -113,21 +116,28 @@ export default function App() {
   }, [restaurantId, menuRefreshToken]);
 
   const cartItemIds = useMemo(() => [...new Set(cart.map((line) => line.item_id))], [cart]);
+  const cartSignature = useMemo(
+    () => cart.map((line) => `${line.key}:${line.quantity}`).sort().join("|"),
+    [cart],
+  );
+  activeCartSignatureRef.current = cartSignature;
 
   useEffect(() => {
     if (!restaurantId || menu?.restaurant.restaurant_id !== restaurantId) {
-      setRecommendations([]);
+      setModelGroups([]);
       setRecommendationError("");
       setLoadingRecommendation(false);
       return;
     }
 
+    setLoadingRecommendation(true);
+    setRecommendationError("");
+    setModelGroups([]);
+    setSelectedRecommendationId(null);
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      setLoadingRecommendation(true);
-      setRecommendationError("");
       Promise.all([
-        getOneRecommendation(restaurantId, cartItemIds, lastAddedItemId, controller.signal),
+        getRecommendationModels(restaurantId, cartItemIds, lastAddedItemId, controller.signal),
         getRestaurantMenu(restaurantId, false),
       ])
         .then(([response, freshMenu]) => {
@@ -140,18 +150,46 @@ export default function App() {
               .map((itemId) => liveItems.get(itemId)?.category_id)
               .filter((value): value is number => value != null),
           );
-          const valid = (response.top_recommendations || []).filter((item) => {
-            const liveItem = liveItems.get(item.item_id);
-            if (!liveItem || !liveItem.is_available || item.addable === false || cartIds.has(item.item_id)) return false;
-            return liveItem.category_id == null || !cartCategories.has(liveItem.category_id);
+          const responseGroups = response.models?.length
+            ? response.models
+            : [{
+                model_key: "ensemble" as const,
+                label_ar: "المزيج الذكي",
+                description_ar: "أفضل الاقتراحات المتاحة",
+                available: Boolean(response.top_recommendations?.length),
+                threshold_fallback_used: Boolean(response.threshold_fallback_used),
+                suggestions: response.top_recommendations || [],
+              }];
+          const validGroups = responseGroups.map((group) => {
+            const seen = new Set<number>();
+            const suggestions = (group.suggestions || []).filter((item) => {
+              const liveItem = liveItems.get(item.item_id);
+              if (
+                seen.has(item.item_id)
+                || !liveItem
+                || !liveItem.is_available
+                || item.addable === false
+                || cartIds.has(item.item_id)
+              ) return false;
+              if (liveItem.category_id != null && cartCategories.has(liveItem.category_id)) return false;
+              seen.add(item.item_id);
+              return true;
+            });
+            return { ...group, available: suggestions.length > 0, suggestions };
           });
-          setRecommendations(valid);
-          setThresholdFallbackUsed(Boolean(response.threshold_fallback_used));
-          setSelectedRecommendationId(valid[0]?.item_id || null);
+          setModelGroups(validGroups);
+          setActiveModelKey((current) => {
+            if (validGroups.some((group) => group.model_key === current && group.available)) return current;
+            const preferred = validGroups.find(
+              (group) => group.model_key === response.default_model_key && group.available,
+            );
+            return preferred?.model_key || validGroups.find((group) => group.available)?.model_key || "ensemble";
+          });
+          setSelectedRecommendationId(null);
         })
         .catch((cause: unknown) => {
           if (cause instanceof DOMException && cause.name === "AbortError") return;
-          setRecommendations([]);
+          setModelGroups([]);
           setRecommendationError(cause instanceof Error ? cause.message : "تعذر تحميل الاقتراح");
         })
         .finally(() => {
@@ -165,6 +203,7 @@ export default function App() {
     };
   }, [
     cartItemIds,
+    cartSignature,
     lastAddedItemId,
     menu?.restaurant.restaurant_id,
     menuRefreshToken,
@@ -199,6 +238,18 @@ export default function App() {
   );
   const cartQuantity = useMemo(() => cart.reduce((total, line) => total + line.quantity, 0), [cart]);
 
+  const activeModelGroup = useMemo(
+    () =>
+      modelGroups.find((group) => group.model_key === activeModelKey && group.available)
+      || modelGroups.find((group) => group.model_key === "ensemble" && group.available)
+      || modelGroups.find((group) => group.available)
+      || null,
+    [activeModelKey, modelGroups],
+  );
+  const recommendations = activeModelGroup?.suggestions || [];
+  const availableModelCount = modelGroups.filter(
+    (group) => group.available && group.model_key !== "ensemble",
+  ).length;
   const recommendation = useMemo(
     () => recommendations.find((item) => item.item_id === selectedRecommendationId) || recommendations[0] || null,
     [recommendations, selectedRecommendationId],
@@ -210,6 +261,7 @@ export default function App() {
   const recommendationSize =
     recommendationMenuItem?.sizes.find((size) => !size.is_deleted && size.is_available)
     || recommendationMenuItem?.sizes.find((size) => !size.is_deleted);
+  const recommendationScore = Math.round(recommendation?.compatibility_percent || 0);
 
   function changeRestaurant(nextId: number) {
     setRestaurantPickerOpen(false);
@@ -217,7 +269,8 @@ export default function App() {
     const hadCart = cart.length > 0;
     setCart([]);
     setLastAddedItemId(null);
-    setRecommendations([]);
+    setModelGroups([]);
+    setActiveModelKey("ensemble");
     setSelectedRecommendationId(null);
     setDetailsOpen(false);
     setRecommendationError("");
@@ -280,21 +333,37 @@ export default function App() {
   function clearCart() {
     setCart([]);
     setLastAddedItemId(null);
-    setRecommendations([]);
+    setModelGroups([]);
+    setActiveModelKey("ensemble");
     setSelectedRecommendationId(null);
     setDetailsOpen(false);
     setRecommendationError("");
+  }
+
+  function removeModelSuggestions(shouldRemove: (item: WidgetRecommendationItem) => boolean) {
+    setModelGroups((current) =>
+      current.map((group) => {
+        const suggestions = group.suggestions.filter((item) => !shouldRemove(item));
+        return { ...group, suggestions, available: suggestions.length > 0 };
+      }),
+    );
+    setActiveModelKey("ensemble");
+    setSelectedRecommendationId(null);
   }
 
   async function addRecommendationToCart() {
     if (!restaurantId || !recommendation || !recommendationMenuItem) return;
     const requestRestaurantId = restaurantId;
     const requestRecommendationId = recommendation.item_id;
+    const requestCartSignature = cartSignature;
     setLoadingRecommendation(true);
     setRecommendationError("");
     try {
       const freshMenu = await getRestaurantMenu(requestRestaurantId, false);
-      if (activeRestaurantIdRef.current !== requestRestaurantId) return;
+      if (
+        activeRestaurantIdRef.current !== requestRestaurantId
+        || activeCartSignatureRef.current !== requestCartSignature
+      ) return;
       setMenu(freshMenu);
       const liveItem = freshMenu.items.find((item) => item.item_id === requestRecommendationId);
       const preferredSizeId = recommendationSize?.item_size_id;
@@ -302,26 +371,29 @@ export default function App() {
         liveItem?.sizes.find((size) => size.item_size_id === preferredSizeId && size.is_available)
         || liveItem?.sizes.find((size) => size.is_available);
       if (!liveItem?.is_available || (liveItem.sizes.length > 0 && !liveSize)) {
-        setRecommendations((current) => current.filter((item) => item.item_id !== recommendation.item_id));
-        setSelectedRecommendationId(null);
+        removeModelSuggestions((item) => item.item_id === recommendation.item_id);
         setRecommendationError("هذا الاقتراح نفد من المخزون، جاري اختيار بديل متاح.");
         setRecommendationRefreshToken((token) => token + 1);
         return;
       }
       addToCart(liveItem, liveSize);
-      setRecommendations((current) =>
-        current.filter((item) =>
-          item.item_id !== liveItem.item_id
-          && (liveItem.category_id == null || item.category_id !== liveItem.category_id),
-        ),
+      removeModelSuggestions(
+        (item) =>
+          item.item_id === liveItem.item_id
+          || (liveItem.category_id != null && item.category_id === liveItem.category_id),
       );
-      setSelectedRecommendationId(null);
       setDetailsOpen(false);
     } catch (cause: unknown) {
-      if (activeRestaurantIdRef.current !== requestRestaurantId) return;
+      if (
+        activeRestaurantIdRef.current !== requestRestaurantId
+        || activeCartSignatureRef.current !== requestCartSignature
+      ) return;
       setRecommendationError(cause instanceof Error ? cause.message : "تعذر التحقق من توفر الاقتراح");
     } finally {
-      if (activeRestaurantIdRef.current === requestRestaurantId) {
+      if (
+        activeRestaurantIdRef.current === requestRestaurantId
+        && activeCartSignatureRef.current === requestCartSignature
+      ) {
         setLoadingRecommendation(false);
       }
     }
@@ -363,7 +435,7 @@ export default function App() {
           <div>
             <p className="eyebrow">BONTECH · LIVE MENU</p>
             <h1>{selectedRestaurant ? restaurantName(selectedRestaurant) : "جاري تحميل المطعم…"}</h1>
-            <p className="muted">منيو حي مع اقتراح ذكي واحد داخل ويدجت.</p>
+            <p className="muted">منيو حي مع عدة محركات اقتراح قابلة للفرز داخل ويدجت.</p>
           </div>
         </div>
         <div className="status-pills">
@@ -543,7 +615,7 @@ export default function App() {
       </main>
 
       {widgetOpen ? (
-        <section className="ai-widget" ref={widgetRef} style={widgetStyle} aria-label="اقتراح ذكي واحد">
+        <section className="ai-widget" ref={widgetRef} style={widgetStyle} aria-label="محركات الاقتراح الذكية">
           <header
             className="widget-head"
             onPointerDown={beginWidgetDrag}
@@ -551,34 +623,78 @@ export default function App() {
             onPointerUp={endWidgetDrag}
             onPointerCancel={endWidgetDrag}
           >
-            <div>
-              <span aria-hidden="true">⋮⋮</span>
-              <strong>اقتراح ذكي</strong>
-              <small>{cartItemIds.length ? "مخصص حسب السلة" : "الأكثر مبيعًا كبداية"}</small>
-            </div>
+             <div>
+               <span aria-hidden="true">⋮⋮</span>
+               <strong>محركات الاقتراح</strong>
+               <small>
+                 {cartItemIds.length
+                   ? `${availableModelCount.toLocaleString("ar-SA")} محركات تحلل السلة`
+                   : "الأكثر طلبًا إلى أن تضيف للسلة"}
+               </small>
+             </div>
             <button type="button" onClick={() => setWidgetOpen(false)} aria-label="إغلاق الويدجت">×</button>
           </header>
-          <div className="widget-body">
-            {recommendationError ? <div className="widget-inline-error">{recommendationError}</div> : null}
-            {loadingRecommendation ? (
-              <div className="widget-empty"><span className="spinner" /> نجهّز اقتراحك…</div>
-            ) : recommendation && recommendationMenuItem ? (
-              <>
-              <article className={recommendations.length > 1 ? "recommendation-card has-stack" : "recommendation-card"}>
-                <span className="ai-badge">AI</span>
-                <div>
-                  <h3>{itemName(recommendationMenuItem)}</h3>
-                  <div className="recommendation-meta">
-                    <span className="type-badge">{recommendation.type_label_ar}</span>
-                    <span className={recommendation.meets_threshold ? "match-badge strong" : "match-badge"}>
-                      توافق {recommendation.compatibility_percent.toLocaleString("ar-SA")}%
-                    </span>
-                  </div>
-                  <p>{recommendation.reason || sourceLabel(recommendation.source)}</p>
-                  <small>{sizeName(recommendationSize)} · {formatPrice(recommendationSize?.price ?? null)}</small>
-                </div>
-                <button type="button" onClick={addRecommendationToCart}>+ أضف</button>
-              </article>
+           <div className="widget-body">
+             {recommendationError ? <div className="widget-inline-error">{recommendationError}</div> : null}
+             {modelGroups.length ? (
+               <nav className="model-filters" aria-label="فرز الاقتراحات حسب المحرك">
+                 {modelGroups.map((group) => (
+                   <button
+                     type="button"
+                     key={group.model_key}
+                     className={activeModelGroup?.model_key === group.model_key ? "active" : ""}
+                     disabled={!group.available}
+                     aria-pressed={activeModelGroup?.model_key === group.model_key}
+                     onClick={() => {
+                       setActiveModelKey(group.model_key);
+                       setSelectedRecommendationId(null);
+                     }}
+                     title={group.description_ar}
+                   >
+                     <span>{group.label_ar}</span>
+                     <b>{group.suggestions.length.toLocaleString("ar-SA")}</b>
+                   </button>
+                 ))}
+               </nav>
+             ) : null}
+             {loadingRecommendation ? (
+               <div className="widget-empty"><span className="spinner" /> نجهّز اقتراحك…</div>
+             ) : recommendation && recommendationMenuItem ? (
+               <>
+               <article className={recommendations.length > 1 ? "recommendation-card has-stack" : "recommendation-card"}>
+                 <span className="ai-badge">AI</span>
+                 <div className="recommendation-copy">
+                   <h3>{itemName(recommendationMenuItem)}</h3>
+                   <div className="recommendation-meta">
+                     <span className="type-badge">{recommendation.model_label_ar}</span>
+                     <span className={recommendation.meets_threshold ? "match-badge strong" : "match-badge"}>
+                       {recommendation.confidence_band_ar}
+                     </span>
+                   </div>
+                   <p>{recommendation.reason || sourceLabel(recommendation.source)}</p>
+                   {activeModelGroup?.model_key === "ensemble" && recommendation.model_agreement_count > 1 ? (
+                     <span className="agreement-badge">
+                       متفق عليه من {recommendation.model_agreement_count.toLocaleString("ar-SA")} محركات
+                     </span>
+                   ) : null}
+                   <small>{sizeName(recommendationSize)} · {formatPrice(recommendationSize?.price ?? null)}</small>
+                 </div>
+                 <div className="recommendation-actions">
+                   <div
+                     className={recommendation.meets_threshold ? "confidence-ring strong" : "confidence-ring"}
+                     style={{ "--score": recommendationScore } as CSSProperties}
+                     role="meter"
+                     aria-valuemin={0}
+                     aria-valuemax={97}
+                     aria-valuenow={recommendationScore}
+                     aria-label={`${recommendation.score_label_ar} ${recommendationScore}%`}
+                   >
+                     <strong>{recommendationScore.toLocaleString("ar-SA")}%</strong>
+                     <small>{recommendation.score_label_ar}</small>
+                   </div>
+                   <button type="button" onClick={addRecommendationToCart}>+ أضف</button>
+                 </div>
+               </article>
               {recommendations.length ? (
                 <button
                   className="recommendation-list-toggle"
@@ -590,36 +706,39 @@ export default function App() {
                   <b aria-hidden="true">{detailsOpen ? "⌃" : "⌄"}</b>
                 </button>
               ) : null}
-              {detailsOpen ? (
-                <section className="recommendation-list" aria-label="أفضل الاقتراحات">
-                  <div className="recommendation-list-head">
-                    <strong>{thresholdFallbackUsed ? "أفضل الاقتراحات المتاحة" : "الاقتراحات التي تجاوزت 70%"}</strong>
-                    <span>مرتبة بعد فحص المخزون والقسم</span>
-                  </div>
-                  {recommendations.map((item, index) => {
+               {detailsOpen ? (
+                 <section className="recommendation-list" aria-label="أفضل الاقتراحات">
+                   <div className="recommendation-list-head">
+                     <strong>{activeModelGroup?.label_ar || "أفضل الاقتراحات"}</strong>
+                     <span>
+                       {activeModelGroup?.threshold_fallback_used
+                         ? "لا توجد نتائج فوق 70% لهذا المحرك؛ نعرض أفضل المتاح."
+                         : activeModelGroup?.description_ar || "مرتبة بعد فحص المخزون والقسم"}
+                     </span>
+                   </div>
+                   {recommendations.map((item, index) => {
                     const liveItem = menu?.items.find((candidate) => candidate.item_id === item.item_id);
                     if (!liveItem) return null;
                     return (
-                      <button
-                        type="button"
-                        className={item.item_id === recommendation.item_id ? "recommendation-list-row active" : "recommendation-list-row"}
-                        key={item.item_id}
-                        onClick={() => {
-                          setSelectedRecommendationId(item.item_id);
-                          setDetailsOpen(false);
-                        }}
-                      >
+                       <button
+                         type="button"
+                         className={item.item_id === recommendation.item_id ? "recommendation-list-row active" : "recommendation-list-row"}
+                         key={`${activeModelGroup?.model_key}:${item.model_key}:${item.item_id}`}
+                         onClick={() => {
+                           setSelectedRecommendationId(item.item_id);
+                         }}
+                       >
                         <span className="rank-number">{index + 1}</span>
-                        <span className="list-copy">
-                          <strong>{itemName(liveItem)}</strong>
-                          <small>{item.type_label_ar}</small>
-                          <i><b style={{ width: `${item.compatibility_percent}%` }} /></i>
-                        </span>
-                        <span className="list-percent">{item.compatibility_percent.toLocaleString("ar-SA")}%</span>
-                      </button>
+                         <span className="list-copy">
+                           <strong>{itemName(liveItem)}</strong>
+                           <small>{item.model_label_ar} · {item.confidence_band_ar}</small>
+                           <i><b style={{ width: `${item.compatibility_percent}%` }} /></i>
+                         </span>
+                         <span className="list-percent">{Math.round(item.compatibility_percent).toLocaleString("ar-SA")}%</span>
+                       </button>
                     );
                   })}
-                  <p className="compatibility-note">نسبة التوافق ترتيبية داخل نوع الاقتراح وليست احتمال شراء.</p>
+                   <p className="compatibility-note">درجة الملاءمة محسوبة لكل محرك على حدة، وليست وعدًا بنسبة شراء مؤكدة.</p>
                 </section>
               ) : null}
               </>
