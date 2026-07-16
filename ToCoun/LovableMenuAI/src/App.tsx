@@ -1,9 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, PointerEvent as ReactPointerEvent } from "react";
-import { getRecommendationModels, getRestaurantMenu, getRestaurants } from "./lib/menuApi";
+import {
+  getRecommendationModels,
+  getRestaurantItemAvailability,
+  getRestaurantMenu,
+  getRestaurants,
+} from "./lib/menuApi";
 import type {
   CartLine,
   MenuItem,
+  MenuItemAvailabilityResponse,
   MenuSize,
   Restaurant,
   RestaurantMenuResponse,
@@ -47,6 +53,36 @@ function availabilityLabel(reason: string) {
       all_sizes_unavailable: "جميع الأحجام نافدة",
     }[reason] || "غير متاح حاليًا"
   );
+}
+
+function mergeItemAvailability(
+  item: MenuItem,
+  availability: MenuItemAvailabilityResponse,
+): MenuItem {
+  const liveSizes = new Map(availability.sizes.map((size) => [size.item_size_id, size]));
+  const mergedSizes = item.sizes.map((size) => {
+    const liveSize = liveSizes.get(size.item_size_id);
+    if (!liveSize) {
+      return {
+        ...size,
+        is_available: false,
+        availability_reason: "size_not_in_live_menu",
+      };
+    }
+    liveSizes.delete(size.item_size_id);
+    return { ...size, ...liveSize, is_deleted: size.is_deleted };
+  });
+  for (const liveSize of liveSizes.values()) {
+    mergedSizes.push({ ...liveSize, is_deleted: false });
+  }
+  return {
+    ...item,
+    category_id: availability.category_id,
+    is_available: availability.is_available,
+    availability_reason: availability.availability_reason,
+    available_size_count: availability.available_size_count,
+    sizes: mergedSizes,
+  };
 }
 
 export default function App() {
@@ -99,7 +135,6 @@ export default function App() {
     let cancelled = false;
     setLoadingMenu(true);
     setError("");
-    setMenu(null);
     getRestaurantMenu(restaurantId, false)
       .then((payload) => {
         if (!cancelled) setMenu(payload);
@@ -132,18 +167,12 @@ export default function App() {
 
     setLoadingRecommendation(true);
     setRecommendationError("");
-    setModelGroups([]);
-    setSelectedRecommendationId(null);
     const controller = new AbortController();
     const timer = window.setTimeout(() => {
-      Promise.all([
-        getRecommendationModels(restaurantId, cartItemIds, lastAddedItemId, controller.signal),
-        getRestaurantMenu(restaurantId, false),
-      ])
-        .then(([response, freshMenu]) => {
+      getRecommendationModels(restaurantId, cartItemIds, lastAddedItemId, controller.signal)
+        .then((response) => {
           if (controller.signal.aborted) return;
-          setMenu(freshMenu);
-          const liveItems = new Map(freshMenu.items.map((item) => [item.item_id, item]));
+          const liveItems = new Map(menu.items.map((item) => [item.item_id, item]));
           const cartIds = new Set(cartItemIds);
           const cartCategories = new Set(
             cartItemIds
@@ -185,17 +214,21 @@ export default function App() {
             );
             return preferred?.model_key || validGroups.find((group) => group.available)?.model_key || "ensemble";
           });
-          setSelectedRecommendationId(null);
+          setSelectedRecommendationId((current) =>
+            current != null
+            && validGroups.some((group) => group.suggestions.some((item) => item.item_id === current))
+              ? current
+              : null,
+          );
         })
         .catch((cause: unknown) => {
           if (cause instanceof DOMException && cause.name === "AbortError") return;
-          setModelGroups([]);
           setRecommendationError(cause instanceof Error ? cause.message : "تعذر تحميل الاقتراح");
         })
         .finally(() => {
           if (!controller.signal.aborted) setLoadingRecommendation(false);
         });
-    }, 220);
+    }, 100);
 
     return () => {
       window.clearTimeout(timer);
@@ -203,7 +236,6 @@ export default function App() {
     };
   }, [
     cartItemIds,
-    cartSignature,
     lastAddedItemId,
     menu?.restaurant.restaurant_id,
     menuRefreshToken,
@@ -355,23 +387,35 @@ export default function App() {
     if (!restaurantId || !recommendation || !recommendationMenuItem) return;
     const requestRestaurantId = restaurantId;
     const requestRecommendationId = recommendation.item_id;
+    const requestMenuItem = recommendationMenuItem;
+    const preferredSizeId = recommendationSize?.item_size_id;
     const requestCartSignature = cartSignature;
     setLoadingRecommendation(true);
     setRecommendationError("");
     try {
-      const freshMenu = await getRestaurantMenu(requestRestaurantId, false);
+      const availability = await getRestaurantItemAvailability(
+        requestRestaurantId,
+        requestRecommendationId,
+      );
       if (
         activeRestaurantIdRef.current !== requestRestaurantId
         || activeCartSignatureRef.current !== requestCartSignature
       ) return;
-      setMenu(freshMenu);
-      const liveItem = freshMenu.items.find((item) => item.item_id === requestRecommendationId);
-      const preferredSizeId = recommendationSize?.item_size_id;
+      const liveItem = mergeItemAvailability(requestMenuItem, availability);
+      setMenu((current) => {
+        if (!current || current.restaurant.restaurant_id !== requestRestaurantId) return current;
+        return {
+          ...current,
+          items: current.items.map((item) => (
+            item.item_id === requestRecommendationId ? liveItem : item
+          )),
+        };
+      });
       const liveSize =
-        liveItem?.sizes.find((size) => size.item_size_id === preferredSizeId && size.is_available)
-        || liveItem?.sizes.find((size) => size.is_available);
-      if (!liveItem?.is_available || (liveItem.sizes.length > 0 && !liveSize)) {
-        removeModelSuggestions((item) => item.item_id === recommendation.item_id);
+        liveItem.sizes.find((size) => size.item_size_id === preferredSizeId && size.is_available)
+        || liveItem.sizes.find((size) => size.is_available);
+      if (!liveItem.is_available || (liveItem.sizes.length > 0 && !liveSize)) {
+        removeModelSuggestions((item) => item.item_id === requestRecommendationId);
         setRecommendationError("هذا الاقتراح نفد من المخزون، جاري اختيار بديل متاح.");
         setRecommendationRefreshToken((token) => token + 1);
         return;
@@ -657,7 +701,7 @@ export default function App() {
                  ))}
                </nav>
              ) : null}
-             {loadingRecommendation ? (
+             {loadingRecommendation && !(recommendation && recommendationMenuItem) ? (
                <div className="widget-empty"><span className="spinner" /> نجهّز اقتراحك…</div>
              ) : recommendation && recommendationMenuItem ? (
                <>
@@ -692,7 +736,9 @@ export default function App() {
                      <strong>{recommendationScore.toLocaleString("ar-SA")}%</strong>
                      <small>{recommendation.score_label_ar}</small>
                    </div>
-                   <button type="button" onClick={addRecommendationToCart}>+ أضف</button>
+                   <button type="button" onClick={addRecommendationToCart} disabled={loadingRecommendation}>
+                     {loadingRecommendation ? "جاري التحديث…" : "+ أضف"}
+                   </button>
                  </div>
                </article>
               {recommendations.length ? (

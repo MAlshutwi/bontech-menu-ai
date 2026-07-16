@@ -17,17 +17,20 @@ import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock, RLock
 
 from fastapi import FastAPI, HTTPException, Query, Request, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.gzip import GZipMiddleware
 
 from .config import MODEL_VERSION, SERVING
 from .model_loader import final_model_path, load_model
 from .recommender import get_engine
 from .db import (fetch_restaurants, fetch_restaurants_with_menu_counts,
-                 fetch_restaurant_menu, fetch_restaurant_menu_with_sizes)
+                 fetch_restaurant_menu, fetch_restaurant_menu_with_sizes,
+                 fetch_restaurant_item_availability)
 from .runtime import (kill_switch_status, check_api_key, api_key_required, tenant_allowed,
                       rate_limit_ok, new_request_id, METRICS)
 from .demo_page import DEMO_HTML
@@ -49,6 +52,13 @@ FINAL_DELIVERY_DEMO = ROOT_DIR / "delivery" / "final_model" / "demo" / "index.ht
 LEGACY_FINAL_DELIVERY_DEMO = ROOT_DIR / "التسليم" / "ديمو" / "index.html"
 LOVABLE_MENU_DIST = ROOT_DIR / "ToCoun" / "LovableMenuAI" / "dist"
 LOVABLE_MENU_INDEX = LOVABLE_MENU_DIST / "index.html"
+RESTAURANTS_CACHE_TTL_SECONDS = 5 * 60
+MENU_CACHE_TTL_SECONDS = 15
+_LIVE_CACHE_LOCK = RLock()
+_RESTAURANTS_LOAD_LOCK = Lock()
+_RESTAURANTS_CACHE = None
+_MENU_CACHE = {}
+_MENU_LOAD_LOCKS = {}
 
 
 @asynccontextmanager
@@ -86,6 +96,7 @@ app.add_middleware(
     allow_headers=["Content-Type", "X-API-Key", "X-Request-Id"],
     expose_headers=["X-Request-Id"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=1000, compresslevel=5)
 
 
 @app.middleware("http")
@@ -241,18 +252,58 @@ def _availability_state(mode, current_value):
     }
 
 
-def _live_menu_payload(restaurant_id: int, include_inactive: bool = False):
-    restaurants = fetch_restaurants()
-    match = restaurants[restaurants["restaurant_id"] == int(restaurant_id)]
-    if match.empty:
-        raise HTTPException(status_code=404, detail="restaurant not found")
+def _reset_live_data_caches():
+    """Clear request-time caches (used by tests and operational refreshes)."""
+    global _RESTAURANTS_CACHE
+    with _LIVE_CACHE_LOCK:
+        _RESTAURANTS_CACHE = None
+        _MENU_CACHE.clear()
 
-    raw = json.loads(
-        fetch_restaurant_menu_with_sizes(restaurant_id, include_inactive)
-        .to_json(orient="records", force_ascii=False)
-    )
+
+def _cached_restaurants_payload(fresh: bool = False):
+    global _RESTAURANTS_CACHE
+    now = time.monotonic()
+    if not fresh:
+        with _LIVE_CACHE_LOCK:
+            cached = _RESTAURANTS_CACHE
+            if cached is not None and cached[0] > now:
+                return cached[1]
+
+    with _RESTAURANTS_LOAD_LOCK:
+        now = time.monotonic()
+        if not fresh:
+            with _LIVE_CACHE_LOCK:
+                cached = _RESTAURANTS_CACHE
+                if cached is not None and cached[0] > now:
+                    return cached[1]
+        rows = json.loads(
+            fetch_restaurants_with_menu_counts().to_json(orient="records", force_ascii=False)
+        )
+        payload = {"restaurants": rows, "count": len(rows), "source": "live_database"}
+        with _LIVE_CACHE_LOCK:
+            _RESTAURANTS_CACHE = (
+                time.monotonic() + RESTAURANTS_CACHE_TTL_SECONDS,
+                payload,
+            )
+        return payload
+
+
+def _fetch_live_menu_payload(restaurant_id: int, include_inactive: bool = False):
+    frame = fetch_restaurant_menu_with_sizes(restaurant_id, include_inactive)
+    if frame.empty:
+        raise HTTPException(status_code=404, detail="restaurant not found")
+    raw = json.loads(frame.to_json(orient="records", force_ascii=False))
+    first_row = raw[0]
+    restaurant = {
+        "restaurant_id": int(first_row["restaurant_id"]),
+        "name": first_row.get("restaurant_name") or f"rest_{int(restaurant_id)}",
+        "name_ar": first_row.get("restaurant_name_ar") or "",
+    }
+
     items_by_id = {}
     for row in raw:
+        if row.get("item_id") is None:
+            continue
         item_id = int(row["item_id"])
         row_availability = _availability_state(
             row.get("availability_mode"),
@@ -311,7 +362,6 @@ def _live_menu_payload(restaurant_id: int, include_inactive: bool = False):
         })
         category["count"] += 1
 
-    restaurant = json.loads(match.iloc[0].to_json(force_ascii=False))
     return {
         "restaurant": restaurant,
         "items": items,
@@ -319,6 +369,87 @@ def _live_menu_payload(restaurant_id: int, include_inactive: bool = False):
         "count": len(items),
         "source": "live_database",
         "include_inactive": include_inactive,
+    }
+
+
+def _live_menu_payload(restaurant_id: int, include_inactive: bool = False, fresh: bool = False):
+    key = (int(restaurant_id), bool(include_inactive))
+    now = time.monotonic()
+    if not fresh:
+        with _LIVE_CACHE_LOCK:
+            cached = _MENU_CACHE.get(key)
+            if cached is not None and cached[0] > now:
+                return cached[1]
+            load_lock = _MENU_LOAD_LOCKS.setdefault(key, Lock())
+    else:
+        with _LIVE_CACHE_LOCK:
+            load_lock = _MENU_LOAD_LOCKS.setdefault(key, Lock())
+
+    with load_lock:
+        now = time.monotonic()
+        if not fresh:
+            with _LIVE_CACHE_LOCK:
+                cached = _MENU_CACHE.get(key)
+                if cached is not None and cached[0] > now:
+                    return cached[1]
+        payload = _fetch_live_menu_payload(int(restaurant_id), bool(include_inactive))
+        with _LIVE_CACHE_LOCK:
+            _MENU_CACHE[key] = (time.monotonic() + MENU_CACHE_TTL_SECONDS, payload)
+        return payload
+
+
+def _live_item_availability_payload(restaurant_id: int, item_id: int):
+    frame = fetch_restaurant_item_availability(restaurant_id, item_id)
+    if frame.empty:
+        raise HTTPException(status_code=404, detail="restaurant not found")
+    raw = json.loads(frame.to_json(orient="records", force_ascii=False))
+    if not raw or raw[0].get("item_id") is None:
+        raise HTTPException(status_code=404, detail="active menu item not found")
+
+    sizes = []
+    item_availability = _availability_state(
+        raw[0].get("availability_mode"),
+        raw[0].get("current_availability_value"),
+    )
+    for row in raw:
+        row_availability = _availability_state(
+            row.get("availability_mode"),
+            row.get("current_availability_value"),
+        )
+        if row.get("item_size_id") is None:
+            item_availability = row_availability
+            continue
+        sizes.append({
+            "item_size_id": int(row["item_size_id"]),
+            "title_ar": row.get("size_ar") or "",
+            "title_en": row.get("size_en") or "",
+            "code": row.get("size_code") or "",
+            "price": row.get("price"),
+            "takeaway_price": row.get("takeaway_price"),
+            **row_availability,
+        })
+
+    if sizes:
+        available_size_count = sum(1 for size in sizes if size["is_available"])
+        is_available = available_size_count > 0
+        availability_reason = (
+            "available_size_exists" if is_available else "all_sizes_unavailable"
+        )
+    else:
+        available_size_count = 0
+        is_available = item_availability["is_available"]
+        availability_reason = item_availability["availability_reason"]
+
+    return {
+        "restaurant_id": int(restaurant_id),
+        "item_id": int(item_id),
+        "category_id": raw[0].get("category_id"),
+        "is_available": is_available,
+        "availability_reason": availability_reason,
+        "available_size_count": available_size_count,
+        "sizes": sizes,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "source": "live_database",
     }
 
 
@@ -623,7 +754,14 @@ def _build_widget_recommendations(req: WidgetRecommendationRequest, request: Req
         result["threshold_percent"] = 70.0
         result["threshold_fallback_used"] = False
     else:
-        live_menu = _live_menu_payload(req.restaurant_id, include_inactive=False)
+        # Reuse the short-lived menu snapshot for fast cart interactions. A fresh,
+        # item-level availability check remains mandatory when a suggestion is
+        # accepted, so stale stock can never be added from the widget.
+        live_menu = _live_menu_payload(
+            req.restaurant_id,
+            include_inactive=False,
+            fresh=False,
+        )
         result = _apply_live_recommendation_rules(
             result,
             live_menu,
@@ -849,13 +987,18 @@ def demo_live_restaurant_menu(restaurant_id: int, include_inactive: bool = True)
 
 
 @app.get("/api/menu/restaurants")
-def menu_restaurants():
+def menu_restaurants(fresh: bool = False):
     """Live restaurant selector for the Lovable menu project (read-only)."""
-    rows = json.loads(fetch_restaurants_with_menu_counts().to_json(orient="records", force_ascii=False))
-    return {"restaurants": rows, "count": len(rows), "source": "live_database"}
+    return _cached_restaurants_payload(fresh=fresh)
 
 
 @app.get("/api/menu/restaurants/{restaurant_id}/items")
-def menu_items(restaurant_id: int, include_inactive: bool = False):
+def menu_items(restaurant_id: int, include_inactive: bool = False, fresh: bool = False):
     """Live menu from the DB, grouped per item with its available sizes/prices."""
-    return _live_menu_payload(restaurant_id, include_inactive)
+    return _live_menu_payload(restaurant_id, include_inactive, fresh=fresh)
+
+
+@app.get("/api/menu/restaurants/{restaurant_id}/items/{item_id}/availability")
+def menu_item_availability(restaurant_id: int, item_id: int):
+    """Fresh, lightweight stock check for one item before accepting it."""
+    return _live_item_availability_payload(restaurant_id, item_id)

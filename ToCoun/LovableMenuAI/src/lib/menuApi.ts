@@ -1,4 +1,9 @@
-import type { Restaurant, RestaurantMenuResponse, WidgetRecommendationResponse } from "../types/menu";
+import type {
+  MenuItemAvailabilityResponse,
+  Restaurant,
+  RestaurantMenuResponse,
+  WidgetRecommendationResponse,
+} from "../types/menu";
 
 const DEPLOYED_API_URL = "https://bontech-menu-ai.onrender.com";
 const host = window.location.hostname;
@@ -7,8 +12,8 @@ const DEFAULT_API_URL = isApiHost ? window.location.origin : DEPLOYED_API_URL;
 const configuredBaseUrl = import.meta.env.VITE_MENU_API_URL?.trim() || DEFAULT_API_URL;
 const baseUrl = configuredBaseUrl.replace(/\/$/, "");
 
-async function getJson<T>(path: string): Promise<T> {
-  const response = await fetch(`${baseUrl}${path}`);
+async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${baseUrl}${path}`, init);
   const body = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(body.detail || `تعذر تحميل البيانات (${response.status})`);
   return body as T;
@@ -31,9 +36,25 @@ export async function getRestaurants(): Promise<Restaurant[]> {
   return response.restaurants;
 }
 
-export function getRestaurantMenu(restaurantId: number, includeInactive: boolean): Promise<RestaurantMenuResponse> {
+export function getRestaurantMenu(
+  restaurantId: number,
+  includeInactive: boolean,
+  fresh = false,
+): Promise<RestaurantMenuResponse> {
+  const freshness = fresh ? "&fresh=true" : "";
   return getJson<RestaurantMenuResponse>(
-    `/api/menu/restaurants/${restaurantId}/items?include_inactive=${includeInactive}`,
+    `/api/menu/restaurants/${restaurantId}/items?include_inactive=${includeInactive}${freshness}`,
+    fresh ? { cache: "no-store" } : undefined,
+  );
+}
+
+export function getRestaurantItemAvailability(
+  restaurantId: number,
+  itemId: number,
+): Promise<MenuItemAvailabilityResponse> {
+  return getJson<MenuItemAvailabilityResponse>(
+    `/api/menu/restaurants/${restaurantId}/items/${itemId}/availability`,
+    { cache: "no-store" },
   );
 }
 

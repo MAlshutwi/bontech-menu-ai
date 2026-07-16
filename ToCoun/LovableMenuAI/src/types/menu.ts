@@ -55,6 +55,32 @@ export interface RestaurantMenuResponse {
   include_inactive: boolean;
 }
 
+export interface MenuItemAvailabilitySize {
+  item_size_id: number;
+  title_ar: string;
+  title_en: string;
+  code: string;
+  price: number | null;
+  takeaway_price: number | null;
+  availability_mode: string | null;
+  availability_configured: boolean;
+  remaining_quantity: number | null;
+  is_available: boolean;
+  availability_reason: string;
+}
+
+export interface MenuItemAvailabilityResponse {
+  restaurant_id: number;
+  item_id: number;
+  category_id: number | null;
+  is_available: boolean;
+  availability_reason: string;
+  available_size_count: number;
+  sizes: MenuItemAvailabilitySize[];
+  checked_at: string;
+  source: "live_database";
+}
+
 export interface CartLine {
   key: string;
   item_id: number;
