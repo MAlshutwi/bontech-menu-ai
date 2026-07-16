@@ -85,6 +85,13 @@ class WidgetRecommendationItem(BaseModel):
     evidence: Dict[str, Any] = Field(default_factory=dict)
     addable: bool = True
     disabled_reason: Optional[str] = None
+    category_id: Optional[int] = None
+    recommendation_context: str = "popular"
+    type_label_ar: str = "الأكثر مبيعًا"
+    compatibility_percent: float = Field(0.0, ge=0.0, le=100.0)
+    meets_threshold: bool = False
+    is_available: bool = True
+    availability_reason: Optional[str] = None
 
 
 class WidgetRecommendationSections(BaseModel):
@@ -106,6 +113,8 @@ class WidgetRecommendationResponse(BaseModel):
     top_recommendations: List[WidgetRecommendationItem] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
     disabled_reason: Optional[str] = None
+    threshold_percent: float = 70.0
+    threshold_fallback_used: bool = False
 
 
 class HealthResponse(BaseModel):

@@ -49,9 +49,9 @@ export function getOneRecommendation(
       restaurant_id: restaurantId,
       cart_item_ids: [...new Set(cartItemIds)],
       last_added_item_id: lastAddedItemId || undefined,
-      // Fetch a small candidate pool; the UI validates it against the live DB menu
-      // and still renders exactly one suggestion.
-      limit: 12,
+      // Fetch enough candidates for live stock/category filtering while the widget
+      // still renders one primary suggestion and at most five details.
+      limit: 30,
       context: { source: "lovable_menu_widget", channel: "web", locale: "ar" },
     },
     signal,

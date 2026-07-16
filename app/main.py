@@ -12,6 +12,7 @@ Security: internal service only; bind to loopback or a private network.
 from __future__ import annotations
 import json
 import logging
+import math
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -194,6 +195,270 @@ def _pick_group_items(eng, restaurant_id: int, payload: dict, cart_set: set[int]
     return out, skipped
 
 
+def _optional_number(value):
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _availability_state(mode, current_value):
+    normalized = str(mode or "").strip().lower()
+    remaining = _optional_number(current_value)
+    configured = bool(normalized)
+    is_available = True
+    reason = "availability_unconfigured"
+
+    if normalized == "outofstock":
+        is_available = False
+        reason = "out_of_stock"
+    elif normalized == "staticquantity":
+        if remaining is not None and remaining <= 0:
+            is_available = False
+            reason = "quantity_depleted"
+        else:
+            reason = "quantity_available" if remaining is not None else "quantity_unknown"
+    elif normalized == "dependonstock":
+        if remaining is not None and remaining <= 0:
+            is_available = False
+            reason = "stock_depleted"
+        else:
+            reason = "stock_available" if remaining is not None else "stock_managed_unknown"
+    elif normalized == "alwaysavailable":
+        reason = "always_available"
+    elif configured:
+        reason = "availability_mode_unknown"
+
+    return {
+        "availability_mode": mode or None,
+        "availability_configured": configured,
+        "remaining_quantity": remaining,
+        "is_available": is_available,
+        "availability_reason": reason,
+    }
+
+
+def _live_menu_payload(restaurant_id: int, include_inactive: bool = False):
+    restaurants = fetch_restaurants()
+    match = restaurants[restaurants["restaurant_id"] == int(restaurant_id)]
+    if match.empty:
+        raise HTTPException(status_code=404, detail="restaurant not found")
+
+    raw = json.loads(
+        fetch_restaurant_menu_with_sizes(restaurant_id, include_inactive)
+        .to_json(orient="records", force_ascii=False)
+    )
+    items_by_id = {}
+    for row in raw:
+        item_id = int(row["item_id"])
+        row_availability = _availability_state(
+            row.get("availability_mode"),
+            row.get("current_availability_value"),
+        )
+        item = items_by_id.setdefault(item_id, {
+            "item_id": item_id,
+            "restaurant_id": int(row["restaurant_id"]),
+            "title_ar": row.get("title_ar") or "",
+            "title_en": row.get("title_en") or "",
+            "category_id": row.get("category_id"),
+            "category_ar": row.get("category_ar") or "",
+            "category_en": row.get("category_en") or "",
+            "is_published": bool(row.get("is_published")),
+            "is_deleted": bool(row.get("is_deleted")),
+            "is_combo": bool(row.get("is_combo")),
+            "calories": row.get("calories"),
+            "sizes": [],
+            "_row_availability": row_availability,
+        })
+        if row.get("item_size_id") is not None:
+            item["sizes"].append({
+                "item_size_id": int(row["item_size_id"]),
+                "title_ar": row.get("size_ar") or "",
+                "title_en": row.get("size_en") or "",
+                "code": row.get("size_code") or "",
+                "price": row.get("price"),
+                "takeaway_price": row.get("takeaway_price"),
+                "is_deleted": bool(row.get("size_is_deleted")),
+                **row_availability,
+            })
+
+    items = list(items_by_id.values())
+    for item in items:
+        row_availability = item.pop("_row_availability")
+        if item["sizes"]:
+            available_size_count = sum(1 for size in item["sizes"] if size["is_available"])
+            item["available_size_count"] = available_size_count
+            item["is_available"] = available_size_count > 0
+            item["availability_reason"] = (
+                "available_size_exists" if available_size_count else "all_sizes_unavailable"
+            )
+        else:
+            item["available_size_count"] = 0
+            item["is_available"] = row_availability["is_available"]
+            item["availability_reason"] = row_availability["availability_reason"]
+
+    categories = {}
+    for item in items:
+        key = str(item["category_id"] or "uncategorized")
+        category = categories.setdefault(key, {
+            "category_id": item["category_id"],
+            "title_ar": item["category_ar"],
+            "title_en": item["category_en"],
+            "count": 0,
+        })
+        category["count"] += 1
+
+    restaurant = json.loads(match.iloc[0].to_json(force_ascii=False))
+    return {
+        "restaurant": restaurant,
+        "items": items,
+        "categories": list(categories.values()),
+        "count": len(items),
+        "source": "live_database",
+        "include_inactive": include_inactive,
+    }
+
+
+_CONTEXT_META = {
+    "popular": ("الأكثر مبيعًا", "popular"),
+    "based_on_cart": ("بناءً على السلة كاملة", "cross_sell"),
+    "based_on_last_item": ("بناءً على آخر صنف", "cross_sell"),
+    "similar_alternatives": ("صنف مشابه", "similar_alternative"),
+}
+
+
+def _recommendation_context(section_name: str, item: dict) -> str:
+    source = str(item.get("source") or "").lower()
+    recommendation_type = str(item.get("recommendation_type") or "").lower()
+    if source in {"restaurant_popularity", "global_common"} or recommendation_type == "popular":
+        return "popular"
+    if source == "item2vec" or recommendation_type == "similar_alternative":
+        return "similar_alternatives"
+    if section_name == "based_on_last_item":
+        return "based_on_last_item"
+    if section_name == "based_on_cart":
+        return "based_on_cart"
+    return section_name if section_name in _CONTEXT_META else "popular"
+
+
+def _apply_live_recommendation_rules(result: dict, live_menu: dict, cart_item_ids, display_limit: int = 5):
+    live_items = {int(item["item_id"]): item for item in live_menu["items"]}
+    cart_ids = set(_unique_positive_ints(cart_item_ids))
+    cart_categories = {
+        live_items[item_id].get("category_id")
+        for item_id in cart_ids
+        if item_id in live_items and live_items[item_id].get("category_id") is not None
+    }
+    pools = {key: [] for key in _CONTEXT_META}
+    pool_seen = {key: set() for key in _CONTEXT_META}
+    skipped = {
+        "not_live": 0,
+        "out_of_stock": 0,
+        "already_in_cart": 0,
+        "same_category_as_cart": 0,
+    }
+
+    for section_name, section_items in (result.get("sections") or {}).items():
+        for raw_item in section_items or []:
+            item_id = int(raw_item["item_id"])
+            live_item = live_items.get(item_id)
+            if live_item is None:
+                skipped["not_live"] += 1
+                continue
+            if not live_item.get("is_available", True):
+                skipped["out_of_stock"] += 1
+                continue
+            if item_id in cart_ids:
+                skipped["already_in_cart"] += 1
+                continue
+            category_id = live_item.get("category_id")
+            if category_id is not None and category_id in cart_categories:
+                skipped["same_category_as_cart"] += 1
+                continue
+
+            context = _recommendation_context(section_name, raw_item)
+            if item_id in pool_seen[context]:
+                continue
+            pool_seen[context].add(item_id)
+            type_label_ar, business_type = _CONTEXT_META[context]
+            pools[context].append({
+                **raw_item,
+                "category_id": category_id,
+                "recommendation_context": context,
+                "recommendation_type": business_type,
+                "type_label_ar": type_label_ar,
+                "is_available": True,
+                "availability_reason": live_item.get("availability_reason"),
+            })
+
+    for context, items in pools.items():
+        items.sort(key=lambda item: (-float(item.get("score") or 0.0), int(item["item_id"])))
+        safe_scores = [max(0.0, min(float(item.get("score") or 0.0), 1.0)) for item in items]
+        max_score = max(safe_scores, default=0.0)
+        for item, raw_score in zip(items, safe_scores):
+            relative_score = raw_score / max_score if max_score > 0 else 0.0
+            compatibility = round((0.5 * raw_score + 0.5 * relative_score) * 100, 1)
+            item["compatibility_percent"] = compatibility
+            item["meets_threshold"] = compatibility >= 70.0
+
+    has_cart = bool(cart_ids)
+    priority = (
+        ["based_on_cart", "based_on_last_item", "popular", "similar_alternatives"]
+        if has_cart
+        else ["popular"]
+    )
+    ranked = []
+    seen = set()
+    for context in priority:
+        for item in pools[context]:
+            item_id = int(item["item_id"])
+            if item_id in seen:
+                continue
+            seen.add(item_id)
+            ranked.append(item)
+
+    max_results = max(1, min(int(display_limit or 5), 5))
+    primary = next(
+        (pools[context][0] for context in priority if pools[context]),
+        None,
+    )
+    qualified = [item for item in ranked if item["meets_threshold"]]
+    threshold_fallback_used = bool(primary and not primary["meets_threshold"])
+    top_recommendations = (
+        ranked[:max_results]
+        if threshold_fallback_used
+        else qualified[:max_results]
+    )
+
+    warnings = list(result.get("warnings") or [])
+    for reason, count in skipped.items():
+        if count:
+            warnings.append(f"{reason}:{count}")
+    if threshold_fallback_used:
+        warnings.append(
+            "priority_primary_below_70_showing_top_ranked"
+            if qualified
+            else "no_recommendations_above_70_showing_top_ranked"
+        )
+    if not top_recommendations:
+        warnings.append("no_eligible_live_recommendations")
+
+    result["sections"] = pools
+    result["top_recommendations"] = top_recommendations
+    result["warnings"] = warnings
+    result["threshold_percent"] = 70.0
+    result["threshold_fallback_used"] = threshold_fallback_used
+    result["fallback_used"] = bool(
+        result.get("fallback_used")
+        or threshold_fallback_used
+        or not top_recommendations
+    )
+    return result
+
+
 def _build_widget_recommendations(req: WidgetRecommendationRequest, request: Request):
     t0 = time.perf_counter()
     result = load_model().recommend(
@@ -202,6 +467,17 @@ def _build_widget_recommendations(req: WidgetRecommendationRequest, request: Req
         last_added_item_id=req.last_added_item_id,
         limit=req.limit,
     )
+    if result.get("disabled_reason"):
+        result["threshold_percent"] = 70.0
+        result["threshold_fallback_used"] = False
+    else:
+        live_menu = _live_menu_payload(req.restaurant_id, include_inactive=False)
+        result = _apply_live_recommendation_rules(
+            result,
+            live_menu,
+            req.cart_item_ids,
+            display_limit=req.limit,
+        )
     latency_ms = round(1000 * (time.perf_counter() - t0), 2)
     result["request_id"] = request.state.request_id
     result["latency_ms"] = latency_ms
@@ -430,55 +706,4 @@ def menu_restaurants():
 @app.get("/api/menu/restaurants/{restaurant_id}/items")
 def menu_items(restaurant_id: int, include_inactive: bool = False):
     """Live menu from the DB, grouped per item with its available sizes/prices."""
-    restaurants = fetch_restaurants()
-    match = restaurants[restaurants["restaurant_id"] == int(restaurant_id)]
-    if match.empty:
-        raise HTTPException(status_code=404, detail="restaurant not found")
-    raw = json.loads(fetch_restaurant_menu_with_sizes(restaurant_id, include_inactive).to_json(orient="records", force_ascii=False))
-    items_by_id = {}
-    for row in raw:
-        item_id = int(row["item_id"])
-        item = items_by_id.setdefault(item_id, {
-            "item_id": item_id,
-            "restaurant_id": int(row["restaurant_id"]),
-            "title_ar": row.get("title_ar") or "",
-            "title_en": row.get("title_en") or "",
-            "category_id": row.get("category_id"),
-            "category_ar": row.get("category_ar") or "",
-            "category_en": row.get("category_en") or "",
-            "is_published": bool(row.get("is_published")),
-            "is_deleted": bool(row.get("is_deleted")),
-            "is_combo": bool(row.get("is_combo")),
-            "calories": row.get("calories"),
-            "sizes": [],
-        })
-        if row.get("item_size_id") is not None:
-            item["sizes"].append({
-                "item_size_id": int(row["item_size_id"]),
-                "title_ar": row.get("size_ar") or "",
-                "title_en": row.get("size_en") or "",
-                "code": row.get("size_code") or "",
-                "price": row.get("price"),
-                "takeaway_price": row.get("takeaway_price"),
-                "is_deleted": bool(row.get("size_is_deleted")),
-            })
-    items = list(items_by_id.values())
-    categories = {}
-    for item in items:
-        key = str(item["category_id"] or "uncategorized")
-        category = categories.setdefault(key, {
-            "category_id": item["category_id"],
-            "title_ar": item["category_ar"],
-            "title_en": item["category_en"],
-            "count": 0,
-        })
-        category["count"] += 1
-    restaurant = json.loads(match.iloc[0].to_json(force_ascii=False))
-    return {
-        "restaurant": restaurant,
-        "items": items,
-        "categories": list(categories.values()),
-        "count": len(items),
-        "source": "live_database",
-        "include_inactive": include_inactive,
-    }
+    return _live_menu_payload(restaurant_id, include_inactive)

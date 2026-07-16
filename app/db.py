@@ -180,6 +180,17 @@ def fetch_restaurant_menu_with_sizes(restaurant_id: int, include_inactive: bool 
         AND (isz.id IS NULL OR COALESCE(isz.isdeleted, false) = false)
     """
     return q(f"""
+        WITH current_menu AS (
+            SELECT rm.id
+            FROM restaurantmenu rm
+            WHERE rm.restaurantid = :restaurant_id
+              AND COALESCE(rm.isdefault, false) = true
+              AND COALESCE(rm.isactive, false) = true
+              AND COALESCE(rm.ispuplish, false) = true
+              AND COALESCE(rm.isdeleted, false) = false
+            ORDER BY COALESCE(rm.updated, rm.created) DESC, rm.id DESC
+            LIMIT 1
+        )
         SELECT mi.id AS item_id,
                mi.restaurantsid AS restaurant_id,
                COALESCE(NULLIF(mi.title_ar, ''), '') AS title_ar,
@@ -197,12 +208,29 @@ def fetch_restaurant_menu_with_sizes(restaurant_id: int, include_inactive: bool 
                rs.refrenceclassificationcode AS size_code,
                isz.price,
                isz.takeawayprice AS takeaway_price,
-               COALESCE(isz.isdeleted, false) AS size_is_deleted
+               COALESCE(isz.isdeleted, false) AS size_is_deleted,
+               availability.settingsvalue AS availability_mode,
+               availability.availabilityvalue AS availability_value,
+               availability.curruntvalue AS current_availability_value
         FROM menuitem mi
         LEFT JOIN menucategory mc ON mc.id = mi.menucategoryid
         LEFT JOIN itemsizes isz ON isz.menuitemid = mi.id
         LEFT JOIN restaurantsizes rs ON rs.id = isz.restaurantsizesid
         LEFT JOIN sizeclassification sc ON sc.id = rs.sizeclassificationid
+        LEFT JOIN LATERAL (
+            SELECT ias.settingsvalue,
+                   ias.availabilityvalue,
+                   ias.curruntvalue
+            FROM itemsavailabilitysettings ias
+            JOIN current_menu cm ON cm.id = ias.menuid
+            WHERE COALESCE(ias.isdeleted, false) = false
+              AND ias.restaurantsizesid = isz.restaurantsizesid
+              AND (ias.menuitemid = mi.id OR ias.menuitemid IS NULL)
+            ORDER BY (ias.menuitemid IS NOT NULL) DESC,
+                     COALESCE(ias.updated, ias.created) DESC,
+                     ias.id DESC
+            LIMIT 1
+        ) availability ON true
         WHERE mi.restaurantsid = :restaurant_id
           {active_filter}
         ORDER BY mi.menucategoryid NULLS LAST, mi.title_en, mi.id, isz.id NULLS LAST

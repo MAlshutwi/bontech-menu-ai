@@ -14,6 +14,11 @@ export interface MenuSize {
   price: number | null;
   takeaway_price: number | null;
   is_deleted: boolean;
+  availability_mode: string | null;
+  availability_configured: boolean;
+  remaining_quantity: number | null;
+  is_available: boolean;
+  availability_reason: string;
 }
 
 export interface MenuItem {
@@ -28,6 +33,9 @@ export interface MenuItem {
   is_deleted: boolean;
   is_combo: boolean;
   calories: number | null;
+  is_available: boolean;
+  availability_reason: string;
+  available_size_count: number;
   sizes: MenuSize[];
 }
 
@@ -67,6 +75,13 @@ export interface WidgetRecommendationItem {
   reason: string;
   addable: boolean;
   disabled_reason: string | null;
+  category_id: number | null;
+  recommendation_context: "popular" | "based_on_cart" | "based_on_last_item" | "similar_alternatives";
+  type_label_ar: string;
+  compatibility_percent: number;
+  meets_threshold: boolean;
+  is_available: boolean;
+  availability_reason: string | null;
 }
 
 export interface WidgetRecommendationResponse {
@@ -86,4 +101,6 @@ export interface WidgetRecommendationResponse {
   top_recommendations: WidgetRecommendationItem[];
   warnings: string[];
   disabled_reason: string | null;
+  threshold_percent: number;
+  threshold_fallback_used: boolean;
 }

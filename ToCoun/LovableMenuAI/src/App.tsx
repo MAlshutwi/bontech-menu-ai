@@ -36,15 +36,15 @@ function sourceLabel(source: string) {
   );
 }
 
-function orderedCandidates(response: Awaited<ReturnType<typeof getOneRecommendation>>) {
-  const sections = response.sections;
-  return [
-    ...(sections?.based_on_last_item || []),
-    ...(sections?.based_on_cart || []),
-    ...(sections?.popular || []),
-    ...(sections?.similar_alternatives || []),
-    ...(response.top_recommendations || []),
-  ];
+function availabilityLabel(reason: string) {
+  return (
+    {
+      out_of_stock: "نفد من المخزون",
+      quantity_depleted: "نفدت الكمية",
+      stock_depleted: "نفد من المخزون",
+      all_sizes_unavailable: "جميع الأحجام نافدة",
+    }[reason] || "غير متاح حاليًا"
+  );
 }
 
 export default function App() {
@@ -57,8 +57,11 @@ export default function App() {
   const [categoryId, setCategoryId] = useState("all");
   const [restaurantPickerOpen, setRestaurantPickerOpen] = useState(false);
   const [widgetOpen, setWidgetOpen] = useState(true);
+  const [detailsOpen, setDetailsOpen] = useState(false);
   const [widgetPosition, setWidgetPosition] = useState<{ left: number; top: number } | null>(null);
-  const [recommendation, setRecommendation] = useState<WidgetRecommendationItem | null>(null);
+  const [recommendations, setRecommendations] = useState<WidgetRecommendationItem[]>([]);
+  const [selectedRecommendationId, setSelectedRecommendationId] = useState<number | null>(null);
+  const [thresholdFallbackUsed, setThresholdFallbackUsed] = useState(false);
   const [recommendationError, setRecommendationError] = useState("");
   const [loadingRestaurants, setLoadingRestaurants] = useState(true);
   const [loadingMenu, setLoadingMenu] = useState(false);
@@ -70,6 +73,7 @@ export default function App() {
 
   const widgetRef = useRef<HTMLElement>(null);
   const dragRef = useRef<{ pointerId: number; offsetX: number; offsetY: number } | null>(null);
+  const activeRestaurantIdRef = useRef<number | null>(null);
 
   useEffect(() => {
     getRestaurants()
@@ -78,7 +82,10 @@ export default function App() {
         const defaultRestaurant = data.find((restaurant) => restaurant.restaurant_id === DEFAULT_RESTAURANT_ID);
         const firstWithMenu = data.find((restaurant) => restaurant.active_item_count > 0);
         const initial = defaultRestaurant || firstWithMenu || data[0];
-        if (initial) setRestaurantId(initial.restaurant_id);
+        if (initial) {
+          activeRestaurantIdRef.current = initial.restaurant_id;
+          setRestaurantId(initial.restaurant_id);
+        }
       })
       .catch((cause: unknown) => setError(cause instanceof Error ? cause.message : "تعذر تحميل المطاعم"))
       .finally(() => setLoadingRestaurants(false));
@@ -108,8 +115,8 @@ export default function App() {
   const cartItemIds = useMemo(() => [...new Set(cart.map((line) => line.item_id))], [cart]);
 
   useEffect(() => {
-    if (!restaurantId || !cartItemIds.length || menu?.restaurant.restaurant_id !== restaurantId) {
-      setRecommendation(null);
+    if (!restaurantId || menu?.restaurant.restaurant_id !== restaurantId) {
+      setRecommendations([]);
       setRecommendationError("");
       setLoadingRecommendation(false);
       return;
@@ -119,21 +126,32 @@ export default function App() {
     const timer = window.setTimeout(() => {
       setLoadingRecommendation(true);
       setRecommendationError("");
-      getOneRecommendation(restaurantId, cartItemIds, lastAddedItemId, controller.signal)
-        .then((response) => {
-          const liveItemIds = new Set(menu.items.map((item) => item.item_id));
+      Promise.all([
+        getOneRecommendation(restaurantId, cartItemIds, lastAddedItemId, controller.signal),
+        getRestaurantMenu(restaurantId, false),
+      ])
+        .then(([response, freshMenu]) => {
+          if (controller.signal.aborted) return;
+          setMenu(freshMenu);
+          const liveItems = new Map(freshMenu.items.map((item) => [item.item_id, item]));
           const cartIds = new Set(cartItemIds);
-          const seen = new Set<number>();
-          const match = orderedCandidates(response).find((item) => {
-            if (seen.has(item.item_id)) return false;
-            seen.add(item.item_id);
-            return item.addable !== false && !cartIds.has(item.item_id) && liveItemIds.has(item.item_id);
+          const cartCategories = new Set(
+            cartItemIds
+              .map((itemId) => liveItems.get(itemId)?.category_id)
+              .filter((value): value is number => value != null),
+          );
+          const valid = (response.top_recommendations || []).filter((item) => {
+            const liveItem = liveItems.get(item.item_id);
+            if (!liveItem || !liveItem.is_available || item.addable === false || cartIds.has(item.item_id)) return false;
+            return liveItem.category_id == null || !cartCategories.has(liveItem.category_id);
           });
-          setRecommendation(match || null);
+          setRecommendations(valid);
+          setThresholdFallbackUsed(Boolean(response.threshold_fallback_used));
+          setSelectedRecommendationId(valid[0]?.item_id || null);
         })
         .catch((cause: unknown) => {
           if (cause instanceof DOMException && cause.name === "AbortError") return;
-          setRecommendation(null);
+          setRecommendations([]);
           setRecommendationError(cause instanceof Error ? cause.message : "تعذر تحميل الاقتراح");
         })
         .finally(() => {
@@ -145,7 +163,14 @@ export default function App() {
       window.clearTimeout(timer);
       controller.abort();
     };
-  }, [cartItemIds, lastAddedItemId, menu, recommendationRefreshToken, restaurantId]);
+  }, [
+    cartItemIds,
+    lastAddedItemId,
+    menu?.restaurant.restaurant_id,
+    menuRefreshToken,
+    recommendationRefreshToken,
+    restaurantId,
+  ]);
 
   const selectedRestaurant = useMemo(
     () => restaurants.find((restaurant) => restaurant.restaurant_id === restaurantId) || menu?.restaurant || null,
@@ -174,11 +199,17 @@ export default function App() {
   );
   const cartQuantity = useMemo(() => cart.reduce((total, line) => total + line.quantity, 0), [cart]);
 
+  const recommendation = useMemo(
+    () => recommendations.find((item) => item.item_id === selectedRecommendationId) || recommendations[0] || null,
+    [recommendations, selectedRecommendationId],
+  );
   const recommendationMenuItem = useMemo(
     () => menu?.items.find((item) => item.item_id === recommendation?.item_id) || null,
     [menu?.items, recommendation?.item_id],
   );
-  const recommendationSize = recommendationMenuItem?.sizes.find((size) => !size.is_deleted) || recommendationMenuItem?.sizes[0];
+  const recommendationSize =
+    recommendationMenuItem?.sizes.find((size) => !size.is_deleted && size.is_available)
+    || recommendationMenuItem?.sizes.find((size) => !size.is_deleted);
 
   function changeRestaurant(nextId: number) {
     setRestaurantPickerOpen(false);
@@ -186,16 +217,23 @@ export default function App() {
     const hadCart = cart.length > 0;
     setCart([]);
     setLastAddedItemId(null);
-    setRecommendation(null);
+    setRecommendations([]);
+    setSelectedRecommendationId(null);
+    setDetailsOpen(false);
     setRecommendationError("");
     setSearch("");
     setCategoryId("all");
     setMenu(null);
+    activeRestaurantIdRef.current = nextId;
     setRestaurantId(nextId);
     setNotice(hadCart ? "تم تغيير المطعم وتصفير السلة." : "تم تغيير المطعم.");
   }
 
   function addToCart(item: MenuItem, size?: MenuSize) {
+    if (!item.is_available || (size && !size.is_available)) {
+      setRecommendationError(availabilityLabel(size?.availability_reason || item.availability_reason));
+      return;
+    }
     const key = `${item.item_id}:${size?.item_size_id || 0}`;
     setCart((current) => {
       const existing = current.find((line) => line.key === key);
@@ -242,8 +280,51 @@ export default function App() {
   function clearCart() {
     setCart([]);
     setLastAddedItemId(null);
-    setRecommendation(null);
+    setRecommendations([]);
+    setSelectedRecommendationId(null);
+    setDetailsOpen(false);
     setRecommendationError("");
+  }
+
+  async function addRecommendationToCart() {
+    if (!restaurantId || !recommendation || !recommendationMenuItem) return;
+    const requestRestaurantId = restaurantId;
+    const requestRecommendationId = recommendation.item_id;
+    setLoadingRecommendation(true);
+    setRecommendationError("");
+    try {
+      const freshMenu = await getRestaurantMenu(requestRestaurantId, false);
+      if (activeRestaurantIdRef.current !== requestRestaurantId) return;
+      setMenu(freshMenu);
+      const liveItem = freshMenu.items.find((item) => item.item_id === requestRecommendationId);
+      const preferredSizeId = recommendationSize?.item_size_id;
+      const liveSize =
+        liveItem?.sizes.find((size) => size.item_size_id === preferredSizeId && size.is_available)
+        || liveItem?.sizes.find((size) => size.is_available);
+      if (!liveItem?.is_available || (liveItem.sizes.length > 0 && !liveSize)) {
+        setRecommendations((current) => current.filter((item) => item.item_id !== recommendation.item_id));
+        setSelectedRecommendationId(null);
+        setRecommendationError("هذا الاقتراح نفد من المخزون، جاري اختيار بديل متاح.");
+        setRecommendationRefreshToken((token) => token + 1);
+        return;
+      }
+      addToCart(liveItem, liveSize);
+      setRecommendations((current) =>
+        current.filter((item) =>
+          item.item_id !== liveItem.item_id
+          && (liveItem.category_id == null || item.category_id !== liveItem.category_id),
+        ),
+      );
+      setSelectedRecommendationId(null);
+      setDetailsOpen(false);
+    } catch (cause: unknown) {
+      if (activeRestaurantIdRef.current !== requestRestaurantId) return;
+      setRecommendationError(cause instanceof Error ? cause.message : "تعذر التحقق من توفر الاقتراح");
+    } finally {
+      if (activeRestaurantIdRef.current === requestRestaurantId) {
+        setLoadingRecommendation(false);
+      }
+    }
   }
 
   function beginWidgetDrag(event: ReactPointerEvent<HTMLElement>) {
@@ -358,7 +439,11 @@ export default function App() {
           <div className="panel-heading">
             <div>
               <h2>منيو المطعم</h2>
-              <p>{menu ? `${menu.count.toLocaleString("ar-SA")} صنف متاح` : "تحميل المنيو الحي…"}</p>
+              <p>
+                {menu
+                  ? `${menu.items.filter((item) => item.is_available).length.toLocaleString("ar-SA")} متاح من ${menu.count.toLocaleString("ar-SA")} صنف`
+                  : "تحميل المنيو الحي…"}
+              </p>
             </div>
             <label className="search-box">
               <span aria-hidden="true">⌕</span>
@@ -370,26 +455,43 @@ export default function App() {
 
           <div className="menu-grid" aria-live="polite">
             {visibleItems.map((item) => (
-              <article className="item-card" key={item.item_id}>
+              <article className={item.is_available ? "item-card" : "item-card out-of-stock"} key={item.item_id}>
                 <div className="item-card-head">
                   <span className="item-icon" aria-hidden="true">✦</span>
-                  <span className="item-id">#{item.item_id}</span>
+                  <span className={item.is_available ? "item-id" : "stock-badge"}>
+                    {item.is_available ? `#${item.item_id}` : availabilityLabel(item.availability_reason)}
+                  </span>
                 </div>
                 <h3>{itemName(item)}</h3>
                 {item.title_ar && item.title_en ? <p className="english-name">{item.title_en}</p> : null}
                 <p className="category-name">{categoryName(item)}</p>
                 <div className="sizes">
-                  {item.sizes.length ? (
-                    item.sizes.map((size) => (
-                      <div className="size-row" key={size.item_size_id}>
-                        <span><b>{sizeName(size)}</b><small>{formatPrice(size.price)}</small></span>
-                        <button type="button" onClick={() => addToCart(item, size)} aria-label={`أضف ${itemName(item)} ${sizeName(size)}`}>+</button>
+                  {item.sizes.some((size) => !size.is_deleted) ? (
+                    item.sizes.filter((size) => !size.is_deleted).map((size) => (
+                      <div className={size.is_available ? "size-row" : "size-row unavailable"} key={size.item_size_id}>
+                        <span>
+                          <b>{sizeName(size)}</b>
+                          <small>{size.is_available ? formatPrice(size.price) : availabilityLabel(size.availability_reason)}</small>
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => addToCart(item, size)}
+                          aria-label={`أضف ${itemName(item)} ${sizeName(size)}`}
+                          disabled={!size.is_available}
+                        >
+                          {size.is_available ? "+" : "×"}
+                        </button>
                       </div>
                     ))
                   ) : (
-                    <div className="size-row">
-                      <span><b>عادي</b><small>السعر عند الطلب</small></span>
-                      <button type="button" onClick={() => addToCart(item)}>+</button>
+                    <div className={item.is_available ? "size-row" : "size-row unavailable"}>
+                      <span>
+                        <b>عادي</b>
+                        <small>{item.is_available ? "السعر عند الطلب" : availabilityLabel(item.availability_reason)}</small>
+                      </span>
+                      <button type="button" onClick={() => addToCart(item)} disabled={!item.is_available}>
+                        {item.is_available ? "+" : "×"}
+                      </button>
                     </div>
                   )}
                 </div>
@@ -412,7 +514,7 @@ export default function App() {
               <div className="empty-cart">
                 <span aria-hidden="true">⌑</span>
                 <strong>السلة فارغة</strong>
-                <p>بعد إضافة أول صنف سيظهر لك اقتراح واحد مناسب داخل الويدجت.</p>
+                <p>يظهر الأكثر مبيعًا أولًا، وبعد إضافة صنف يتخصص الاقتراح حسب السلة.</p>
               </div>
             ) : (
               <div className="cart-lines">
@@ -449,37 +551,89 @@ export default function App() {
             onPointerUp={endWidgetDrag}
             onPointerCancel={endWidgetDrag}
           >
-            <div><span aria-hidden="true">⋮⋮</span><strong>اقتراح ذكي</strong><small>اقتراح واحد فقط</small></div>
+            <div>
+              <span aria-hidden="true">⋮⋮</span>
+              <strong>اقتراح ذكي</strong>
+              <small>{cartItemIds.length ? "مخصص حسب السلة" : "الأكثر مبيعًا كبداية"}</small>
+            </div>
             <button type="button" onClick={() => setWidgetOpen(false)} aria-label="إغلاق الويدجت">×</button>
           </header>
           <div className="widget-body">
-            {!cartItemIds.length ? (
-              <div className="widget-empty">أضف صنفًا للسلة وسنقترح لك إضافة واحدة مناسبة.</div>
-            ) : loadingRecommendation ? (
+            {recommendationError ? <div className="widget-inline-error">{recommendationError}</div> : null}
+            {loadingRecommendation ? (
               <div className="widget-empty"><span className="spinner" /> نجهّز اقتراحك…</div>
             ) : recommendation && recommendationMenuItem ? (
-              <article className="recommendation-card">
+              <>
+              <article className={recommendations.length > 1 ? "recommendation-card has-stack" : "recommendation-card"}>
                 <span className="ai-badge">AI</span>
                 <div>
                   <h3>{itemName(recommendationMenuItem)}</h3>
-                  <p>{sourceLabel(recommendation.source)}</p>
+                  <div className="recommendation-meta">
+                    <span className="type-badge">{recommendation.type_label_ar}</span>
+                    <span className={recommendation.meets_threshold ? "match-badge strong" : "match-badge"}>
+                      توافق {recommendation.compatibility_percent.toLocaleString("ar-SA")}%
+                    </span>
+                  </div>
+                  <p>{recommendation.reason || sourceLabel(recommendation.source)}</p>
                   <small>{sizeName(recommendationSize)} · {formatPrice(recommendationSize?.price ?? null)}</small>
                 </div>
-                <button type="button" onClick={() => addToCart(recommendationMenuItem, recommendationSize)}>+ أضف</button>
+                <button type="button" onClick={addRecommendationToCart}>+ أضف</button>
               </article>
-            ) : recommendationError ? (
+              {recommendations.length ? (
+                <button
+                  className="recommendation-list-toggle"
+                  type="button"
+                  aria-expanded={detailsOpen}
+                  onClick={() => setDetailsOpen((open) => !open)}
+                >
+                  <span>{detailsOpen ? "إخفاء قائمة الاقتراحات" : `عرض قائمة الاقتراحات (${recommendations.length})`}</span>
+                  <b aria-hidden="true">{detailsOpen ? "⌃" : "⌄"}</b>
+                </button>
+              ) : null}
+              {detailsOpen ? (
+                <section className="recommendation-list" aria-label="أفضل الاقتراحات">
+                  <div className="recommendation-list-head">
+                    <strong>{thresholdFallbackUsed ? "أفضل الاقتراحات المتاحة" : "الاقتراحات التي تجاوزت 70%"}</strong>
+                    <span>مرتبة بعد فحص المخزون والقسم</span>
+                  </div>
+                  {recommendations.map((item, index) => {
+                    const liveItem = menu?.items.find((candidate) => candidate.item_id === item.item_id);
+                    if (!liveItem) return null;
+                    return (
+                      <button
+                        type="button"
+                        className={item.item_id === recommendation.item_id ? "recommendation-list-row active" : "recommendation-list-row"}
+                        key={item.item_id}
+                        onClick={() => {
+                          setSelectedRecommendationId(item.item_id);
+                          setDetailsOpen(false);
+                        }}
+                      >
+                        <span className="rank-number">{index + 1}</span>
+                        <span className="list-copy">
+                          <strong>{itemName(liveItem)}</strong>
+                          <small>{item.type_label_ar}</small>
+                          <i><b style={{ width: `${item.compatibility_percent}%` }} /></i>
+                        </span>
+                        <span className="list-percent">{item.compatibility_percent.toLocaleString("ar-SA")}%</span>
+                      </button>
+                    );
+                  })}
+                  <p className="compatibility-note">نسبة التوافق ترتيبية داخل نوع الاقتراح وليست احتمال شراء.</p>
+                </section>
+              ) : null}
+              </>
+            ) : (
               <div className="widget-empty error-copy">
-                <span>{recommendationError}</span>
+                <span>لا يوجد اقتراح متاح بعد فلترة المخزون وأقسام السلة.</span>
                 <button type="button" onClick={() => setRecommendationRefreshToken((token) => token + 1)}>إعادة المحاولة</button>
               </div>
-            ) : (
-              <div className="widget-empty">لا يوجد اقتراح حي مناسب لهذه السلة حاليًا.</div>
             )}
           </div>
         </section>
       ) : (
         <button className="widget-toggle" type="button" onClick={() => setWidgetOpen(true)}>
-          <span>✦</span> اقتراح ذكي {recommendation ? <b>1</b> : null}
+          <span>✦</span> اقتراح ذكي {recommendations.length ? <b>{recommendations.length}</b> : null}
         </button>
       )}
     </div>

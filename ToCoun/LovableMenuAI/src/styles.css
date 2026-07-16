@@ -213,9 +213,11 @@ h1, h2, h3, p { margin: 0; }
   background: #fff;
   box-shadow: 0 6px 18px rgba(36, 30, 23, .04);
 }
+.item-card.out-of-stock { border-color: #e3c5bd; background: #fbf7f4; opacity: .82; }
 .item-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 11px; }
 .item-icon { width: 34px; height: 34px; display: grid; place-items: center; border-radius: 11px; color: var(--accent-dark); background: #fff0eb; }
 .item-id { padding: 4px 7px; border-radius: 999px; color: #69736e; background: #f2f2ef; font-size: 10px; font-weight: 900; }
+.stock-badge { padding: 4px 7px; border-radius: 999px; color: #a23f31; background: #ffe7e1; font-size: 10px; font-weight: 950; }
 .item-card h3 { font-size: 15px; line-height: 1.5; overflow-wrap: anywhere; }
 .english-name, .category-name { margin-top: 4px; color: var(--muted); font-size: 11px; line-height: 1.4; }
 .category-name { color: var(--green); font-weight: 850; }
@@ -246,6 +248,8 @@ h1, h2, h3, p { margin: 0; }
   font-weight: 900;
   box-shadow: 0 5px 12px rgba(242, 121, 101, .2);
 }
+.size-row.unavailable { color: #8d6961; background: #f5ebe7; }
+.size-row.unavailable button { color: #9a6257; background: #e6cdc6; box-shadow: none; }
 
 .cart-panel { position: sticky; top: 14px; overflow: hidden; }
 .cart-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 16px; color: #fff; background: var(--navy); }
@@ -275,6 +279,9 @@ h1, h2, h3, p { margin: 0; }
   top: 110px;
   z-index: 2147483000;
   width: min(360px, calc(100vw - 24px));
+  max-height: calc(100vh - 24px);
+  display: flex;
+  flex-direction: column;
   overflow: hidden;
   border: 1px solid #f1b8aa;
   border-radius: 20px;
@@ -301,17 +308,38 @@ h1, h2, h3, p { margin: 0; }
 .widget-head strong { font-size: 14px; }
 .widget-head small { color: var(--muted); font-size: 9px; font-weight: 800; }
 .widget-head > button { width: 30px; height: 30px; border: 1px solid var(--line); border-radius: 10px; color: var(--ink); background: #fff; font-size: 18px; }
-.widget-body { padding: 12px; }
+.widget-body { padding: 12px; overflow: auto; }
 .widget-empty { min-height: 86px; display: flex; align-items: center; justify-content: center; gap: 8px; padding: 14px; border: 1px dashed #ddcabc; border-radius: 14px; color: var(--muted); background: var(--soft); text-align: center; font-size: 12px; line-height: 1.6; }
+.widget-inline-error { margin-bottom: 9px; padding: 8px 10px; border: 1px solid #efbdb3; border-radius: 10px; color: #9c3b2d; background: #fff3f0; font-size: 10px; font-weight: 850; line-height: 1.5; }
 .spinner { width: 17px; height: 17px; border: 2px solid #f0c4b9; border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .recommendation-card { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; padding: 13px; border: 1px solid #ead8c9; border-radius: 15px; background: linear-gradient(135deg, #fff7f1, #fff); }
+.recommendation-card.has-stack { margin-bottom: 9px; box-shadow: 0 5px 0 -2px #f1dfd2, 0 10px 0 -5px #f6eae1; }
 .recommendation-card > div { min-width: 0; padding-right: 31px; }
 .ai-badge { position: absolute; top: 12px; right: 12px; width: 25px; height: 25px; display: grid; place-items: center; border-radius: 8px; color: #fff; background: var(--accent); font-size: 9px; font-weight: 950; }
 .recommendation-card h3 { font-size: 14px; line-height: 1.45; }
 .recommendation-card p { margin-top: 4px; color: var(--green); font-size: 10px; font-weight: 900; }
 .recommendation-card small { display: block; margin-top: 7px; color: var(--muted); font-size: 10px; }
 .recommendation-card > button { align-self: center; border: 0; border-radius: 11px; padding: 9px 11px; color: #fff; background: var(--accent); font-size: 11px; font-weight: 950; }
+.recommendation-meta { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.type-badge, .match-badge { display: inline-flex; align-items: center; border: 1px solid #cbdcf5; border-radius: 999px; padding: 3px 6px; color: #275c9b; background: #f0f5fd; font-size: 9px; font-weight: 900; }
+.match-badge { color: #6f5a35; border-color: #e5d3ae; background: #fff8e8; direction: rtl; }
+.match-badge.strong { color: #176947; border-color: #b7dcca; background: #edf8f2; }
+.recommendation-list-toggle { width: 100%; min-height: 38px; display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 8px; padding: 8px 10px; border: 1px solid #e4d1c2; border-radius: 11px; color: #55453d; background: #fffaf5; font-size: 10px; font-weight: 950; }
+.recommendation-list { display: grid; gap: 7px; margin-top: 8px; padding-top: 9px; border-top: 1px solid var(--line); }
+.recommendation-list-head { display: grid; gap: 2px; padding: 0 2px 4px; }
+.recommendation-list-head strong { font-size: 11px; }
+.recommendation-list-head span { color: var(--muted); font-size: 9px; }
+.recommendation-list-row { width: 100%; display: grid; grid-template-columns: 25px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 8px; border: 1px solid #eadccf; border-radius: 11px; color: var(--ink); background: #fff; text-align: right; }
+.recommendation-list-row.active { border-color: #ee9f8c; background: #fff5f1; }
+.rank-number { width: 23px; height: 23px; display: grid; place-items: center; border-radius: 8px; color: #fff; background: var(--navy); font-size: 9px; font-weight: 950; }
+.list-copy { min-width: 0; display: grid; gap: 2px; }
+.list-copy strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 10px; }
+.list-copy small { color: #52736a; font-size: 8px; font-weight: 850; }
+.list-copy i { width: 100%; height: 4px; overflow: hidden; border-radius: 999px; background: #eee6de; }
+.list-copy i b { height: 100%; display: block; border-radius: inherit; background: linear-gradient(90deg, var(--accent), #f2b46e); }
+.list-percent { min-width: 38px; color: var(--green); font-size: 10px; font-weight: 950; direction: rtl; }
+.compatibility-note { padding: 2px 3px 0; color: #877970; font-size: 8px; line-height: 1.5; }
 .error-copy { flex-direction: column; color: #9c3b2d; border-color: #eebbb1; background: #fff4f1; }
 .error-copy button { border: 1px solid #e5b4aa; border-radius: 9px; padding: 6px 9px; color: #8e3629; background: #fff; font-size: 10px; font-weight: 900; }
 .widget-toggle {
