@@ -22,6 +22,8 @@ RUN groupadd --system --gid 10001 bontech \
 
 COPY --chown=bontech:bontech . .
 COPY --from=menu_frontend --chown=bontech:bontech /frontend/dist /app/ToCoun/LovableMenuAI/dist
+RUN mkdir -p /app/artifacts /app/reports \
+    && chown -R bontech:bontech /app/artifacts /app/reports
 
 USER bontech
 

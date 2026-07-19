@@ -30,6 +30,8 @@ def test_container_and_frontend_dependencies_are_reproducible():
     assert dockerfile.count("@sha256:") == 2
     assert "USER bontech" in dockerfile
     assert "COPY --chown=bontech:bontech . ." in dockerfile
+    assert "mkdir -p /app/artifacts /app/reports" in dockerfile
+    assert "chown -R bontech:bontech /app/artifacts /app/reports" in dockerfile
     versions = {**package["dependencies"], **package["devDependencies"]}
     assert versions
     assert all(version != "latest" for version in versions.values())
