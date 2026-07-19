@@ -41,6 +41,10 @@ def test_portable_model_excludes_customer_profiles():
     assert model.engine.profiles == {}
     assert "customer_profiles.parquet" not in model.source_artifacts
     assert model.metadata["privacy"]["contains_customer_profiles"] is False
+    personalized = model.metadata["validated_model_selection"]["personalized"]
+    assert personalized["validated"] is False
+    assert personalized["validation_value"] is None
+    assert personalized["unavailable_reason"] == "insufficient_validated_customer_order_linkage"
 
 
 def test_live_candidates_support_unknown_restaurant_and_avoid_last_category():
@@ -164,6 +168,53 @@ def test_model_recommend_other_restaurant_works():
     assert result["restaurant_id"] == OTHER_RID
     assert result["disabled_reason"] is None
     assert result["top_recommendations"]
+
+
+def test_restaurant_192_uses_its_best_validated_cart_model():
+    model = load_model(MODEL_PATH)
+    restaurant_id = 192
+    seed = model.engine.menu(restaurant_id)["default_cart_item_ids"][0]
+
+    result = model.recommend(
+        restaurant_id=restaurant_id,
+        cart_item_ids=[seed],
+        last_added_item_id=seed,
+        limit=5,
+        context={"timestamp": "2026-07-19T16:30:00+03:00"},
+    )
+
+    selected = result["selected_model"]
+    assert selected["model_key"] == "fbt_confidence"
+    assert selected["validation_metric"] == "recall@5"
+    assert selected["validation_percent"] == 36.53
+    assert selected["validation_trials"] == 2297
+    assert selected["validation_scope"] == "restaurant:192"
+    assert all(
+        item["evidence"].get("ranking_strategy") == "fbt_confidence"
+        for item in result["sections"]["based_on_cart"]
+        if item["source"] == "restaurant_fbt"
+    )
+
+
+def test_time_context_uses_riyadh_period_and_period_validation():
+    model = load_model(MODEL_PATH)
+
+    # 13:30 UTC is 16:30 in Riyadh, which belongs to the trained afternoon bucket.
+    result = model.recommend(
+        restaurant_id=192,
+        cart_item_ids=[],
+        limit=5,
+        context={"timestamp": "2026-07-19T13:30:00Z"},
+    )
+
+    selected = result["selected_model"]
+    assert result["time_period_key"] == "afternoon"
+    assert result["time_period_ar"] == "العصر"
+    assert result["sections"]["time_context"]
+    assert selected["model_key"] == "time_aware_popularity"
+    assert selected["validation_metric"] == "recall@10"
+    assert selected["validation_percent"] == 51.39
+    assert selected["validation_trials"] == 9862
 
 
 def test_unknown_restaurant_safe():

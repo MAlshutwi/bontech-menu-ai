@@ -93,6 +93,38 @@ export interface CartLine {
   remaining_quantity: number | null;
 }
 
+export type RecommendationContributingModel =
+  | string
+  | {
+      model_key?: string;
+      model_label_ar?: string;
+      label_ar?: string;
+      source?: string;
+      source_label_ar?: string;
+      context_key?: string;
+      role?: "selected" | "supporting" | string;
+      validated?: boolean;
+      validation_metric?: string | null;
+      validation_percent?: number | null;
+      validation_trials?: number | null;
+      validation_scope?: string | null;
+      validation_source?: string | null;
+      evaluation_version?: string | null;
+      time_period_key?: string | null;
+      time_period_ar?: string | null;
+      weight?: number;
+      score?: number;
+    };
+
+export interface RecommendationAccuracyMetric {
+  name?: string;
+  key?: string;
+  label_ar?: string;
+  /** Object-shaped metrics must explicitly declare that they were validated. */
+  validated?: boolean;
+  evaluation_scope?: string;
+}
+
 export interface WidgetRecommendationItem {
   item_id: number;
   title_ar: string;
@@ -104,9 +136,9 @@ export interface WidgetRecommendationItem {
   addable: boolean;
   disabled_reason: string | null;
   category_id: number | null;
-  recommendation_context: "popular" | "based_on_cart" | "based_on_last_item" | "similar_alternatives";
+  recommendation_context: "popular" | "time_context" | "based_on_cart" | "based_on_last_item" | "similar_alternatives";
   type_label_ar: string;
-  model_key: "full_cart" | "last_item" | "similarity" | "popularity";
+  model_key: string;
   model_label_ar: string;
   score_label_ar: string;
   rank: number;
@@ -117,13 +149,30 @@ export interface WidgetRecommendationItem {
   meets_threshold: boolean;
   is_available: boolean;
   availability_reason: string | null;
+  /** Exact model contributors and Arabic rationale labels supplied by the API. */
+  selected_model?: RecommendationContributingModel | null;
+  supporting_models?: RecommendationContributingModel[];
+  contributing_models?: RecommendationContributingModel[];
+  source_labels_ar?: string[] | string;
+  time_period_ar?: string | null;
+  /** Offline model metric; never interchangeable with compatibility_percent. */
+  model_accuracy_percent?: number | null;
+  accuracy_metric?: string | RecommendationAccuracyMetric | null;
+  model_accuracy_metric?: string | null;
 }
 
 export interface WidgetRecommendationModelGroup {
-  model_key: "ensemble" | "full_cart" | "last_item" | "similarity" | "popularity";
+  model_key: string;
   label_ar: string;
   description_ar: string;
   available: boolean;
+  selected?: boolean;
+  validated?: boolean;
+  validation_metric?: string | null;
+  validation_percent?: number | null;
+  validation_trials?: number | null;
+  validation_scope?: string | null;
+  evaluation_version?: string | null;
   threshold_fallback_used: boolean;
   suggestions: WidgetRecommendationItem[];
 }
@@ -141,6 +190,7 @@ export interface WidgetRecommendationResponse {
     based_on_cart: WidgetRecommendationItem[];
     similar_alternatives: WidgetRecommendationItem[];
     popular: WidgetRecommendationItem[];
+    time_context: WidgetRecommendationItem[];
   };
   top_recommendations: WidgetRecommendationItem[];
   models: WidgetRecommendationModelGroup[];
@@ -150,6 +200,12 @@ export interface WidgetRecommendationResponse {
   disabled_reason: string | null;
   threshold_percent: number;
   threshold_fallback_used: boolean;
+  selected_model?: RecommendationContributingModel | null;
+  supporting_models?: RecommendationContributingModel[];
+  selection_policy?: string | null;
+  time_period_key?: string | null;
+  time_period_ar?: string | null;
+  unavailable_models?: RecommendationContributingModel[];
 }
 
 export type RecommendationEventType = "shown" | "clicked" | "added_to_cart" | "dismissed";

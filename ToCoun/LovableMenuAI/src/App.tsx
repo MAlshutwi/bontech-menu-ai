@@ -46,11 +46,131 @@ function sourceLabel(source: string) {
     {
       restaurant_fbt: "يُطلب غالبًا مع اختيارك",
       restaurant_popularity: "من الأكثر طلبًا",
+      time_popularity: "الأكثر طلبًا في هذه الفترة",
+      restaurant_time_popularity: "الأكثر طلبًا في هذه الفترة",
       item2vec: "مشابه لاختيارك",
       pooled_fbt: "مناسب لسلتك",
       global_common: "اقتراح شائع",
+      live_menu_fallback: "اختيار متاح من المنيو",
     }[source] || "اختيار ذكي"
   );
+}
+
+const MODEL_LABELS_AR: Record<string, string> = {
+  ensemble: "المزيج الذكي",
+  full_cart: "مودل السلة كاملة",
+  cart: "مودل السلة كاملة",
+  last_item: "مودل آخر صنف",
+  similarity: "مودل التشابه",
+  popularity: "مودل الأكثر مبيعًا",
+  global_popularity: "مودل الأكثر مبيعًا",
+  time_context: "مودل الفترة الزمنية",
+  time_popularity: "مودل الأكثر مبيعًا حسب الوقت",
+  time_aware_popularity: "الأكثر مبيعًا حسب الفترة الزمنية",
+  restaurant_popularity: "الأكثر مبيعًا في المطعم",
+  fbt_confidence: "ارتباط السلة حسب الثقة",
+  fbt_hybrid: "ارتباط السلة الهجين",
+  fbt_paircount: "ارتباط السلة حسب التكرار",
+  fbt_lift: "ارتباط السلة حسب الرفع",
+  item2vec: "مودل تشابه الأصناف",
+  pooled_fbt: "ارتباط السلة العام",
+  live_menu_fallback: "اختيار متاح من المنيو",
+  personalized: "مودل المستخدم",
+};
+
+const TIME_PERIODS_AR: Record<string, string> = {
+  morning: "الصباح",
+  breakfast: "الصباح",
+  noon: "الظهر",
+  lunch: "الظهر",
+  afternoon: "العصر",
+  evening: "المساء",
+  night: "الليل",
+  dinner: "الليل",
+  late_night: "آخر الليل",
+};
+
+function uniqueArabicLabels(values: string[]) {
+  const seen = new Set<string>();
+  return values.map((value) => value.trim()).filter((normalized) => {
+    if (!normalized) return false;
+    const key = normalized.toLocaleLowerCase("ar");
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function stringLabels(value: string[] | string | null | undefined) {
+  if (Array.isArray(value)) return uniqueArabicLabels(value.filter((label) => typeof label === "string"));
+  if (typeof value !== "string") return [];
+  return uniqueArabicLabels(value.split(/\s*\+\s*/));
+}
+
+function modelKeyLabel(value: string) {
+  const normalized = value.trim();
+  return MODEL_LABELS_AR[normalized] || normalized;
+}
+
+function recommendationProvenance(item: WidgetRecommendationItem) {
+  const contributors = uniqueArabicLabels(
+    (item.contributing_models || []).map((contributor) => {
+      if (typeof contributor === "string") return modelKeyLabel(contributor);
+      const exactLabel = contributor.model_label_ar
+        || contributor.label_ar
+        || contributor.source_label_ar
+        || contributor.model_key
+        || contributor.source
+        || "";
+      return modelKeyLabel(exactLabel);
+    }),
+  );
+  if (!contributors.length && item.model_label_ar) contributors.push(item.model_label_ar);
+
+  const labels = stringLabels(item.source_labels_ar);
+  if (!labels.length) labels.push(sourceLabel(item.source));
+
+  const timePeriod = item.time_period_ar?.trim();
+  if (timePeriod) {
+    const translatedPeriod = TIME_PERIODS_AR[timePeriod] || timePeriod;
+    if (!labels.some((label) => label.includes(translatedPeriod) || label.includes("الفترة"))) {
+      labels.push(`مناسب لفترة ${translatedPeriod}`);
+    }
+  }
+
+  if (
+    item.recommendation_context === "based_on_cart"
+    && !labels.some((label) => label.includes("سلت"))
+  ) {
+    labels.push("حسب السلة");
+  }
+
+  return {
+    models: uniqueArabicLabels(contributors),
+    sources: uniqueArabicLabels(labels),
+  };
+}
+
+function validatedModelAccuracy(item: WidgetRecommendationItem) {
+  const percent = item.model_accuracy_percent;
+  if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || percent > 100) return null;
+
+  const rawMetric = item.accuracy_metric ?? item.model_accuracy_metric;
+  if (!rawMetric) return null;
+  if (typeof rawMetric === "object" && rawMetric.validated !== true) return null;
+
+  const metricName = typeof rawMetric === "string"
+    ? rawMetric.trim()
+    : (rawMetric.label_ar || rawMetric.name || rawMetric.key || "").trim();
+  if (!metricName) return null;
+
+  const normalizedMetric = metricName.toLocaleLowerCase("en");
+  const label = normalizedMetric.includes("recall@5")
+    ? "Recall@5 الموثّق"
+    : normalizedMetric.includes("accuracy")
+      ? "دقة المودل الموثّقة"
+      : "نتيجة المودل الموثّقة";
+  return { percent: Math.round(percent * 10) / 10, metricName, label };
 }
 
 function availabilityLabel(reason: string) {
@@ -248,9 +368,7 @@ export default function App() {
                 threshold_fallback_used: Boolean(response.threshold_fallback_used),
                 suggestions: response.top_recommendations || [],
               }];
-          const scopedGroups = cartIds.size
-            ? responseGroups.filter((group) => group.model_key !== "popularity")
-            : responseGroups.filter((group) => group.model_key === "popularity");
+          const scopedGroups = responseGroups;
           const validGroups = scopedGroups.map((group) => {
             const seen = new Set<number>();
             const suggestions = (group.suggestions || []).filter((item) => {
@@ -279,14 +397,13 @@ export default function App() {
             restaurantId: requestRestaurantId,
             cartItemKey: requestCartItemKey,
           });
-          setActiveModelKey((current) => {
-            if (validGroups.some((group) => group.model_key === current && group.available)) return current;
+          setActiveModelKey(() => {
             const preferred = validGroups.find(
               (group) => group.model_key === response.default_model_key && group.available,
             );
             return preferred?.model_key
               || validGroups.find((group) => group.available)?.model_key
-              || (cartIds.size ? "ensemble" : "popularity");
+              || (cartIds.size ? "fbt_confidence" : "restaurant_popularity");
           });
           setSelectedRecommendationId(null);
         })
@@ -361,14 +478,7 @@ export default function App() {
     [cart],
   );
   const cartQuantity = useMemo(() => cart.reduce((total, line) => total + line.quantity, 0), [cart]);
-  const visibleModelGroups = useMemo(
-    () => (
-      cartItemIds.length
-        ? modelGroups.filter((group) => group.model_key !== "popularity")
-        : modelGroups.filter((group) => group.model_key === "popularity")
-    ),
-    [cartItemIds.length, modelGroups],
-  );
+  const visibleModelGroups = modelGroups;
 
   const activeModelGroup = useMemo(
     () =>
@@ -379,9 +489,6 @@ export default function App() {
     [activeModelKey, visibleModelGroups],
   );
   const recommendations = activeModelGroup?.suggestions || [];
-  const availableModelCount = visibleModelGroups.filter(
-    (group) => group.available && group.model_key !== "ensemble",
-  ).length;
   const recommendation = useMemo(
     () => recommendations.find((item) => item.item_id === selectedRecommendationId) || recommendations[0] || null,
     [recommendations, selectedRecommendationId],
@@ -404,6 +511,8 @@ export default function App() {
     recommendationMenuItem?.is_available && (!recommendationRequiresSize || recommendationSize),
   );
   const recommendationScore = Math.round(recommendation?.compatibility_percent || 0);
+  const recommendationSourceDetails = recommendation ? recommendationProvenance(recommendation) : null;
+  const recommendationAccuracy = recommendation ? validatedModelAccuracy(recommendation) : null;
 
   function emitRecommendationEvent(
     eventType: RecommendationEventType,
@@ -1067,38 +1176,17 @@ export default function App() {
           >
              <div>
                <span aria-hidden="true">⋮⋮</span>
-               <strong>محركات الاقتراح</strong>
+               <strong>أفضل اقتراح موثّق</strong>
                <small>
                  {cartItemIds.length
-                   ? `${availableModelCount.toLocaleString("ar-SA")} محركات تحلل السلة`
-                   : "الأكثر طلبًا إلى أن تضيف للسلة"}
+                   ? "المودل الأعلى في الاختبار لهذا المطعم"
+                   : "الأكثر طلبًا في الفترة الحالية عند توفر بياناتها"}
                </small>
              </div>
             <button type="button" onClick={dismissWidget} aria-label="إغلاق الويدجت">×</button>
           </header>
            <div className="widget-body">
              {recommendationError ? <div className="widget-inline-error">{recommendationError}</div> : null}
-             {visibleModelGroups.length > 1 ? (
-               <nav className="model-filters" aria-label="فرز الاقتراحات حسب المحرك">
-                 {visibleModelGroups.map((group) => (
-                   <button
-                     type="button"
-                     key={group.model_key}
-                     className={activeModelGroup?.model_key === group.model_key ? "active" : ""}
-                     disabled={!group.available}
-                     aria-pressed={activeModelGroup?.model_key === group.model_key}
-                     onClick={() => {
-                       setActiveModelKey(group.model_key);
-                       setSelectedRecommendationId(null);
-                     }}
-                     title={group.description_ar}
-                   >
-                     <span>{group.label_ar}</span>
-                     <b>{group.suggestions.length.toLocaleString("ar-SA")}</b>
-                   </button>
-                 ))}
-               </nav>
-             ) : null}
              {loadingRecommendation && !(recommendation && recommendationMenuItem) ? (
                <div className="widget-empty"><span className="spinner" /> نجهّز اقتراحك…</div>
              ) : recommendation && recommendationMenuItem ? (
@@ -1108,12 +1196,22 @@ export default function App() {
                  <div className="recommendation-copy">
                    <h3>{itemName(recommendationMenuItem)}</h3>
                    <div className="recommendation-meta">
-                     <span className="type-badge">{recommendation.model_label_ar}</span>
+                     <span className="type-badge">
+                       المودل: {recommendationSourceDetails?.models.join(" + ") || recommendation.model_label_ar}
+                     </span>
                      <span className={recommendation.meets_threshold ? "match-badge strong" : "match-badge"}>
                        {recommendation.confidence_band_ar}
                      </span>
+                     {recommendationAccuracy ? (
+                       <span className="accuracy-badge" title={`مقياس التقييم: ${recommendationAccuracy.metricName}`}>
+                         {recommendationAccuracy.label} {recommendationAccuracy.percent.toLocaleString("ar-SA")}%
+                       </span>
+                     ) : null}
                    </div>
-                   <p>{recommendation.reason || sourceLabel(recommendation.source)}</p>
+                   <p className="source-summary">
+                     <b>مصادر الاقتراح:</b> {recommendationSourceDetails?.sources.join(" + ") || sourceLabel(recommendation.source)}
+                   </p>
+                   {recommendation.reason ? <p className="recommendation-reason">{recommendation.reason}</p> : null}
                    {activeModelGroup?.model_key === "ensemble" && recommendation.model_agreement_count > 1 ? (
                      <span className="agreement-badge">
                        متفق عليه من {recommendation.model_agreement_count.toLocaleString("ar-SA")} محركات
@@ -1127,7 +1225,7 @@ export default function App() {
                      style={{ "--score": recommendationScore } as CSSProperties}
                      role="meter"
                      aria-valuemin={0}
-                     aria-valuemax={97}
+                     aria-valuemax={100}
                      aria-valuenow={recommendationScore}
                      aria-label={`${recommendation.score_label_ar} ${recommendationScore}%`}
                    >
@@ -1168,6 +1266,8 @@ export default function App() {
                    {recommendations.map((item, index) => {
                     const liveItem = menu?.items.find((candidate) => candidate.item_id === item.item_id);
                     if (!liveItem) return null;
+                    const provenance = recommendationProvenance(item);
+                    const accuracy = validatedModelAccuracy(item);
                     return (
                        <button
                          type="button"
@@ -1181,14 +1281,28 @@ export default function App() {
                         <span className="rank-number">{index + 1}</span>
                          <span className="list-copy">
                            <strong>{itemName(liveItem)}</strong>
-                           <small>{item.model_label_ar} · {item.confidence_band_ar}</small>
+                           <small className="list-model">المودل: {provenance.models.join(" + ") || item.model_label_ar}</small>
+                           <small className="list-sources">{provenance.sources.join(" + ")}</small>
+                           {accuracy ? (
+                             <small className="list-accuracy" title={`مقياس التقييم: ${accuracy.metricName}`}>
+                               {accuracy.label}: {accuracy.percent.toLocaleString("ar-SA")}%
+                             </small>
+                           ) : null}
                            <i><b style={{ width: `${item.compatibility_percent}%` }} /></i>
                          </span>
-                         <span className="list-percent">{Math.round(item.compatibility_percent).toLocaleString("ar-SA")}%</span>
+                         <span
+                           className="list-percent"
+                           aria-label={`درجة الملاءمة ${Math.round(item.compatibility_percent)}%`}
+                           title="درجة الملاءمة للاقتراح"
+                         >
+                           {Math.round(item.compatibility_percent).toLocaleString("ar-SA")}%
+                         </span>
                        </button>
                     );
                   })}
-                   <p className="compatibility-note">درجة الملاءمة محسوبة لكل محرك على حدة، وليست وعدًا بنسبة شراء مؤكدة.</p>
+                   <p className="compatibility-note">
+                     النسبة بجانب كل صنف هي درجة ملاءمته للسلة، وليست دقة المودل. دقة المودل لا تظهر إلا عند توفر مقياس تقييم موثّق من الخادم.
+                   </p>
                 </section>
               ) : null}
               </>

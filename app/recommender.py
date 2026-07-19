@@ -13,11 +13,21 @@ Serving rules:
 from __future__ import annotations
 import json
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import pandas as pd
 
 from .config import (ARTIFACTS, HYBRID_WEIGHTS, SERVING, CUSTOMER, MODEL_VERSION,
                      PHASE09, PHASE10)
 from .trial_models import hour_to_bucket
+
+
+RIYADH_TIMEZONE = ZoneInfo("Asia/Riyadh")
+_FBT_STRATEGY_FIELD = {
+    "fbt_confidence": "conf",
+    "fbt_hybrid": "hybrid",
+    "fbt_lift": "lift",
+    "fbt_paircount": "pc",
+}
 
 
 def _f(x):
@@ -216,18 +226,21 @@ class Recommender:
         return names
 
     # ---------------- Recommendation sources ----------------
-    def _fbt_scores(self, rid, cart):
+    def _fbt_scores(self, rid, cart, strategy="fbt_hybrid"):
         agg, ev = {}, {}
         table = self.fbt.get(rid, {})
+        strategy = strategy if strategy in _FBT_STRATEGY_FIELD else "fbt_hybrid"
+        score_field = _FBT_STRATEGY_FIELD[strategy]
         for ci in cart:
             for r in table.get(ci, []):
                 b = r["b"]
                 if b in cart:
                     continue
-                agg[b] = agg.get(b, 0.0) + r["hybrid"]
+                agg[b] = agg.get(b, 0.0) + max(0.0, _f(r[score_field]))
                 if b not in ev or r["pc"] > ev[b]["pair_count"]:
                     ev[b] = {"with_item": ci, "pair_count": r["pc"],
-                             "confidence": round(r["conf"], 4), "lift": round(r["lift"], 3)}
+                             "confidence": round(r["conf"], 4), "lift": round(r["lift"], 3),
+                             "ranking_strategy": strategy}
         mx = max(agg.values()) if agg else 0.0
         scores = {k: v / mx for k, v in agg.items()} if mx > 0 else {}
         return scores, ev
@@ -267,6 +280,10 @@ class Recommender:
             dt = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
         except Exception:
             return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=RIYADH_TIMEZONE)
+        else:
+            dt = dt.astimezone(RIYADH_TIMEZONE)
         return hour_to_bucket(dt.hour, self.time_buckets)
 
     def _time_aware_scores(self, rid, context):
@@ -349,6 +366,7 @@ class Recommender:
         top_k=None,
         context=None,
         cart_only=False,
+        ranking_strategy="fbt_hybrid",
     ):
         rid = int(restaurant_id)
         top_k = int(top_k or SERVING.get("default_top_k", 5))
@@ -357,7 +375,7 @@ class Recommender:
         weights, has_cust = self._weights(customer_id)
         avail = self.rest_items.get(rid, set())
 
-        fbt_s, fbt_ev = self._fbt_scores(rid, cart)
+        fbt_s, fbt_ev = self._fbt_scores(rid, cart, ranking_strategy)
         # Pooled fallback for low-data restaurants without restaurant-specific FBT.
         pooled_used = False
         if not fbt_s and self.pooled_enabled:
@@ -445,6 +463,7 @@ class Recommender:
             "recommendations": recs,
             "fallback_used": fallback_used,
             "model_version": self.model_version,
+            "ranking_strategy": ranking_strategy,
         }
 
     def _dedup_key(self, it):
@@ -668,6 +687,7 @@ class Recommender:
         ta = self._time_aware_scores(rid, context)
         if not ta:
             return []
+        time_bucket = self._bucket(context)
         avail = self.rest_items.get(rid, set())
         out, seen = [], set(self._dedup_key(c) for c in cart
                             if self.item_category.get(c) not in self.repeatable)
@@ -678,7 +698,9 @@ class Recommender:
             if k in seen:
                 continue
             seen.add(k)
-            out.append(self._format(it, sc, "time_based", None))
+            formatted = self._format(it, sc, "time_based", None)
+            formatted["evidence"] = {"time_bucket": time_bucket}
+            out.append(formatted)
             if len(out) >= top_k:
                 break
         return out
@@ -706,6 +728,7 @@ class Recommender:
         include_types=None,
         context=None,
         cart_only=False,
+        ranking_strategy="fbt_hybrid",
     ):
         """Return grouped rails while preserving legacy recommendations for compatibility."""
         rid = int(restaurant_id)
@@ -722,6 +745,7 @@ class Recommender:
             top_k,
             context,
             cart_only=cart_only,
+            ranking_strategy=ranking_strategy,
         )
         groups = []
         for t in include:
@@ -745,6 +769,7 @@ class Recommender:
             "fallback_used": base["fallback_used"],
             "model_version": self.model_version,
             "experiment_id": None,
+            "ranking_strategy": ranking_strategy,
         }
 
 

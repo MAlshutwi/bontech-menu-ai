@@ -9,6 +9,28 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
+
+
+RIYADH_TIMEZONE = ZoneInfo("Asia/Riyadh")
+TIME_PERIOD_LABELS_AR = {
+    "breakfast": "الصباح",
+    "lunch": "الظهر",
+    "afternoon": "العصر",
+    "dinner": "الليل",
+    "late_night": "آخر الليل",
+}
+MODEL_LABELS_AR = {
+    "fbt_confidence": "الارتباط حسب الثقة",
+    "fbt_hybrid": "الارتباط الهجين",
+    "fbt_paircount": "الارتباط حسب تكرار الطلب",
+    "fbt_lift": "الارتباط حسب قوة الرفع",
+    "time_aware_popularity": "الأكثر طلبًا في هذه الفترة",
+    "restaurant_popularity": "الأكثر طلبًا",
+    "item2vec": "التشابه السلوكي",
+    "pooled_fbt": "ارتباط المطاعم المشابهة",
+    "live_menu_fallback": "استكشاف المنيو المتاح",
+}
 
 
 def _as_serving_version(version: str) -> str:
@@ -104,6 +126,7 @@ class BonTechRecommendationModel:
         limit: int = 5,
         previous_top_item_id: int | None = None,
         live_candidates: list[dict[str, Any]] | None = None,
+        context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         rid = int(restaurant_id)
         top_k = max(1, min(int(limit or 5), 50))
@@ -117,12 +140,18 @@ class BonTechRecommendationModel:
         warnings: list[str] = []
         disabled_reason = None
         live_items = self._normalize_live_candidates(live_candidates)
+        request_context = dict(context or {})
+        if not request_context.get("timestamp"):
+            request_context["timestamp"] = datetime.now(RIYADH_TIMEZONE).isoformat()
+        time_period_key = self.engine._bucket(request_context)
+        time_period_ar = TIME_PERIOD_LABELS_AR.get(time_period_key)
 
         sections = {
             "based_on_last_item": [],
             "based_on_cart": [],
             "similar_alternatives": [],
             "popular": [],
+            "time_context": [],
         }
 
         if last_item and last_item not in cart_set:
@@ -132,7 +161,12 @@ class BonTechRecommendationModel:
         if not self.known_restaurant(rid) and not live_items:
             disabled_reason = "unknown_restaurant_or_no_menu_artifacts"
             warnings.append(disabled_reason)
-            return self._response(rid, cart_ids, last_item, sections, [], True, disabled_reason, warnings)
+            return self._response(
+                rid, cart_ids, last_item, sections, [], True, disabled_reason, warnings,
+                selected_model=self._unvalidated_model("live_menu_fallback", "no_menu_candidates"),
+                time_period_key=time_period_key,
+                time_period_ar=time_period_ar,
+            )
 
         if not cart_ids:
             popular_items = (
@@ -153,6 +187,24 @@ class BonTechRecommendationModel:
                 candidate_k,
                 excluded,
             )
+            time_items = (
+                self.engine._time_based_list(rid, set(), request_context, candidate_k)
+                if self.known_restaurant(rid)
+                else []
+            )
+            time_payload = {
+                "recommendation_groups": [{"type": "time_based", "items": time_items}],
+                "fallback_used": not bool(time_items),
+            }
+            sections["time_context"], time_skipped = self._pick_group_items(
+                rid,
+                time_payload,
+                cart_set,
+                set(),
+                ["time_based"],
+                candidate_k,
+                excluded,
+            )
             if not sections["popular"] and live_items:
                 sections["popular"] = self._live_fallback_items(
                     live_items,
@@ -164,7 +216,21 @@ class BonTechRecommendationModel:
                 )
                 warnings.append("live_menu_discovery_fallback")
             warnings.extend(skipped[:10])
-            top_recommendations = self._top_recommendations(sections, top_k, has_cart=False)
+            warnings.extend(time_skipped[:10])
+            if sections["time_context"]:
+                selected_context = "time_context"
+                selected_model = self._empty_cart_selection(time_period_key, use_time=True)
+            elif sections["popular"] and sections["popular"][0].get("source") != "live_menu_fallback":
+                selected_context = "popular"
+                selected_model = self._empty_cart_selection(time_period_key, use_time=False)
+            else:
+                selected_context = "popular"
+                selected_model = self._unvalidated_model(
+                    "live_menu_fallback", "no_validated_popularity_artifact"
+                )
+            top_recommendations = self._top_recommendations(
+                sections, top_k, has_cart=False, selected_context=selected_context
+            )
             if previous_top and not top_recommendations:
                 warnings.append("no_alternative_after_rotation")
             return self._response(
@@ -176,13 +242,15 @@ class BonTechRecommendationModel:
                 True,
                 disabled_reason,
                 warnings,
+                selected_model=selected_model,
+                time_period_key=time_period_key,
+                time_period_ar=time_period_ar,
             )
 
-        include = ["cross_sell", "similar_alternative"]
-        context = {
-            "source": "pos_widget",
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
+        include = ["cross_sell", "similar_alternative", "popular", "time_based"]
+        request_context.setdefault("source", "pos_widget")
+        selected_model = self._cart_selection(rid)
+        ranking_strategy = selected_model.get("strategy") or "fbt_hybrid"
 
         def call_engine(ids: list[int]) -> dict[str, Any]:
             return self.engine.recommend_groups(
@@ -190,8 +258,9 @@ class BonTechRecommendationModel:
                 cart_item_ids=ids,
                 top_k=candidate_k,
                 include_types=include,
-                context=context,
+                context=request_context,
                 cart_only=True,
+                ranking_strategy=ranking_strategy,
             )
 
         last_payload = call_engine([last_item]) if last_item and self.known_restaurant(rid) else {
@@ -234,6 +303,35 @@ class BonTechRecommendationModel:
             excluded,
         )
         skipped_all.extend(skipped)
+        sections["popular"], skipped = self._pick_group_items(
+            rid,
+            cart_payload,
+            cart_set,
+            set(),
+            ["popular"],
+            candidate_k,
+            excluded,
+        )
+        skipped_all.extend(skipped)
+        sections["time_context"], skipped = self._pick_group_items(
+            rid,
+            cart_payload,
+            cart_set,
+            set(),
+            ["time_based"],
+            candidate_k,
+            excluded,
+        )
+        skipped_all.extend(skipped)
+
+        supporting_sections = {
+            "popular": list(sections["popular"]),
+            "time_context": list(sections["time_context"]),
+        }
+        # Popularity and time are corroborating evidence after the cart starts;
+        # they are not standalone cart recommendations.
+        sections["popular"] = []
+        sections["time_context"] = []
 
         live_fallback_used = False
         if live_items:
@@ -256,7 +354,19 @@ class BonTechRecommendationModel:
             if reason not in warnings:
                 warnings.append(reason)
 
-        top_recommendations = self._top_recommendations(sections, top_k, has_cart=True)
+        selected_sources = {
+            str(item.get("source") or "") for item in sections["based_on_cart"]
+        }
+        if selected_sources and "restaurant_fbt" not in selected_sources:
+            if "pooled_fbt" in selected_sources:
+                selected_model = self._unvalidated_model("pooled_fbt", "pooled_fallback_not_validated")
+            elif "live_menu_fallback" in selected_sources:
+                selected_model = self._unvalidated_model(
+                    "live_menu_fallback", "live_menu_fallback_not_validated"
+                )
+        top_recommendations = self._top_recommendations(
+            sections, top_k, has_cart=True, selected_context="based_on_cart"
+        )
         if previous_top and not top_recommendations:
             warnings.append("no_alternative_after_rotation")
         fallback_used = bool(
@@ -267,8 +377,74 @@ class BonTechRecommendationModel:
             or disabled_reason
         )
         return self._response(
-            rid, cart_ids, last_item, sections, top_recommendations, fallback_used, disabled_reason, warnings
+            rid,
+            cart_ids,
+            last_item,
+            sections,
+            top_recommendations,
+            fallback_used,
+            disabled_reason,
+            warnings,
+            selected_model=selected_model,
+            time_period_key=time_period_key,
+            time_period_ar=time_period_ar,
+            supporting_sections=supporting_sections,
         )
+
+    def _validation_catalog(self) -> dict[str, Any]:
+        return dict(self.metadata.get("validated_model_selection") or {})
+
+    def _decorate_validation(self, record: dict[str, Any]) -> dict[str, Any]:
+        out = dict(record or {})
+        model_key = str(out.get("model_key") or out.get("strategy") or "unvalidated")
+        out["model_key"] = model_key
+        out["label_ar"] = MODEL_LABELS_AR.get(model_key, model_key)
+        value = out.get("validation_value")
+        out["validation_percent"] = (
+            round(max(0.0, min(float(value), 1.0)) * 100.0, 2)
+            if value is not None and out.get("validated")
+            else None
+        )
+        out["evaluation_version"] = self._validation_catalog().get("evaluation_version")
+        return out
+
+    def _cart_selection(self, restaurant_id: int) -> dict[str, Any]:
+        cart = self._validation_catalog().get("cart") or {}
+        record = (cart.get("by_restaurant") or {}).get(str(int(restaurant_id)))
+        if not record:
+            record = cart.get("global") or {}
+        if not record:
+            return self._unvalidated_model("fbt_hybrid", "validation_metadata_missing")
+        return self._decorate_validation(record)
+
+    def _empty_cart_selection(self, time_period_key: str | None, *, use_time: bool) -> dict[str, Any]:
+        empty = self._validation_catalog().get("empty_cart") or {}
+        key = "time_aware_popularity" if use_time else "restaurant_popularity"
+        record = dict(empty.get(key) or {})
+        if use_time and time_period_key:
+            period_record = (record.get("by_time_period") or {}).get(time_period_key)
+            if period_record:
+                record.update(period_record)
+        if not record:
+            return self._unvalidated_model(key, "validation_metadata_missing")
+        record["model_key"] = key
+        if time_period_key:
+            record["time_period_key"] = time_period_key
+            record["time_period_ar"] = TIME_PERIOD_LABELS_AR.get(time_period_key)
+        return self._decorate_validation(record)
+
+    def _unvalidated_model(self, model_key: str, reason: str) -> dict[str, Any]:
+        return self._decorate_validation({
+            "model_key": model_key,
+            "strategy": model_key,
+            "validated": False,
+            "validation_metric": None,
+            "validation_value": None,
+            "validation_trials": 0,
+            "validation_scope": "unvalidated",
+            "validation_source": None,
+            "unavailable_reason": reason,
+        })
 
     def _normalize_live_candidates(
         self,
@@ -385,6 +561,10 @@ class BonTechRecommendationModel:
         fallback_used: bool,
         disabled_reason: str | None,
         warnings: list[str],
+        selected_model: dict[str, Any] | None = None,
+        time_period_key: str | None = None,
+        time_period_ar: str | None = None,
+        supporting_sections: dict[str, list[dict[str, Any]]] | None = None,
     ) -> dict[str, Any]:
         return {
             "model_version": self.model_version,
@@ -396,6 +576,11 @@ class BonTechRecommendationModel:
             "fallback_used": bool(fallback_used),
             "disabled_reason": disabled_reason,
             "warnings": warnings,
+            "selected_model": selected_model,
+            "selection_policy": self._validation_catalog().get("selection_policy"),
+            "time_period_key": time_period_key,
+            "time_period_ar": time_period_ar,
+            "supporting_sections": dict(supporting_sections or {}),
         }
 
     def _pick_group_items(
@@ -469,14 +654,19 @@ class BonTechRecommendationModel:
         sections: dict[str, list[dict[str, Any]]],
         limit: int,
         has_cart: bool,
+        selected_context: str | None = None,
     ) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
         seen: set[int] = set()
-        top_limit = min(2, max(1, int(limit)))
+        top_limit = max(1, int(limit))
         section_order = (
-            ("based_on_cart", "based_on_last_item", "similar_alternatives")
-            if has_cart
-            else ("popular",)
+            (selected_context,)
+            if selected_context
+            else (
+                ("based_on_cart", "based_on_last_item", "similar_alternatives")
+                if has_cart
+                else ("popular",)
+            )
         )
         for section_name in section_order:
             for item in sections[section_name]:

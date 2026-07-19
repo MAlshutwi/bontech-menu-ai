@@ -69,9 +69,9 @@ def test_empty_cart_starts_with_live_popular_and_drops_out_of_stock():
     assert [item["item_id"] for item in ranked["top_recommendations"]] == [1]
     assert ranked["top_recommendations"][0]["recommendation_context"] == "popular"
     assert ranked["top_recommendations"][0]["type_label_ar"] == "الأكثر طلبًا"
-    assert ranked["available_model_keys"] == ["popularity"]
-    assert [model["model_key"] for model in ranked["models"]] == ["popularity"]
-    assert ranked["default_model_key"] == "popularity"
+    assert ranked["available_model_keys"] == ["restaurant_popularity"]
+    assert [model["model_key"] for model in ranked["models"]] == ["restaurant_popularity"]
+    assert ranked["default_model_key"] == "restaurant_popularity"
     assert all(
         item["meets_threshold"] == (item["compatibility_percent"] >= 70)
         for item in ranked["top_recommendations"]
@@ -102,14 +102,14 @@ def test_cart_priority_and_same_category_filter_prevent_similar_drinks():
         last_added_item_id=10,
     )
 
-    assert [item["item_id"] for item in ranked["top_recommendations"]] == [3]
+    assert [item["item_id"] for item in ranked["top_recommendations"]] == [2]
     full_cart = next(
         model for model in ranked["models"] if model["model_key"] == "full_cart"
     )
     assert full_cart["suggestions"][0]["recommendation_context"] == "based_on_cart"
     assert full_cart["suggestions"][0]["type_label_ar"] == "السلة كاملة"
     assert full_cart["suggestions"][0]["model_key"] == "full_cart"
-    assert "same_category_as_last_item:1" in ranked["warnings"]
+    assert "same_category_as_last_item:2" in ranked["warnings"]
     assert all(model["model_key"] != "popularity" for model in ranked["models"])
     assert ranked["sections"]["popular"] == []
 
@@ -143,7 +143,7 @@ def test_display_limit_is_honored_after_live_ranking():
     assert ranked["top_recommendations"][0]["item_id"] == 1
 
 
-def test_balanced_model_combines_available_strategies_before_refill():
+def test_selected_cart_model_does_not_blend_alternative_rankings():
     live_menu = {
         "items": [
             _item(10, 5),
@@ -164,8 +164,8 @@ def test_balanced_model_combines_available_strategies_before_refill():
     ranked = _apply_live_recommendation_rules(result, live_menu, [10])
 
     assert ranked["top_recommendations"][0]["model_key"] == "full_cart"
-    assert [item["item_id"] for item in ranked["top_recommendations"]] == [1, 5, 2, 3]
-    assert len({item["item_id"] for item in ranked["top_recommendations"]}) == 4
+    assert [item["item_id"] for item in ranked["top_recommendations"]] == [1, 5]
+    assert len({item["item_id"] for item in ranked["top_recommendations"]}) == 2
     assert all(item["model_key"] != "popularity" for item in ranked["top_recommendations"])
     assert [item["compatibility_percent"] for item in ranked["top_recommendations"]] == sorted(
         [item["compatibility_percent"] for item in ranked["top_recommendations"]],
@@ -185,10 +185,9 @@ def test_model_catalog_is_independent_and_confidence_is_stable():
     ranked = _apply_live_recommendation_rules(result, live_menu, [99])
     groups = {group["model_key"]: group for group in ranked["models"]}
 
-    assert list(groups) == ["ensemble", "full_cart", "last_item", "similarity"]
+    assert list(groups) == ["full_cart"]
     assert groups["full_cart"]["suggestions"][0]["item_id"] == 1
-    assert groups["last_item"]["suggestions"][0]["item_id"] == 1
-    assert groups["ensemble"]["suggestions"][0]["model_agreement_count"] == 2
+    assert groups["full_cart"]["suggestions"][0]["model_agreement_count"] == 2
     assert ranked["sections"]["popular"] == []
     assert [item["compatibility_percent"] for item in ranked["sections"]["based_on_cart"]] == sorted(
         [item["compatibility_percent"] for item in ranked["sections"]["based_on_cart"]],
@@ -228,9 +227,8 @@ def test_model_source_identity_is_pure_and_weak_model_does_not_pollute_ensemble(
     assert [item["item_id"] for item in groups["full_cart"]["suggestions"]] == [1]
     assert "popularity" not in groups
     assert ranked["sections"]["popular"] == []
-    assert groups["last_item"]["threshold_fallback_used"] is True
-    assert groups["last_item"]["suggestions"][0]["compatibility_percent"] < 70
-    assert all(item["meets_threshold"] for item in groups["ensemble"]["suggestions"])
+    assert groups["full_cart"]["threshold_fallback_used"] is False
+    assert all(item["meets_threshold"] for item in groups["full_cart"]["suggestions"])
     assert ranked["threshold_fallback_used"] is False
     assert "model_source_mismatch:1" in ranked["warnings"]
     assert "popular_after_cart:1" in ranked["warnings"]
@@ -282,3 +280,115 @@ def test_previous_visible_item_is_excluded_from_every_model():
         for item in model["suggestions"]
     )
     assert "previous_top_excluded:2" in ranked["warnings"]
+
+
+def test_selected_model_keeps_exact_validated_accuracy_and_combined_provenance():
+    live_menu = {
+        "items": [_item(99, 1), _item(1, 2), _item(2, 3)],
+    }
+    result = _result(
+        based_on_cart=[_rec(1, 0.80)],
+        popular=[
+            _rec(1, 0.70, "restaurant_popularity", "popular"),
+            _rec(2, 0.90, "restaurant_popularity", "popular"),
+        ],
+        time_context=[
+            _rec(1, 0.75, "time_based", "popular"),
+            _rec(2, 0.95, "time_based", "popular"),
+        ],
+    )
+    result.update({
+        "selected_model": {
+            "model_key": "fbt_confidence",
+            "strategy": "fbt_confidence",
+            "label_ar": "الارتباط حسب الثقة",
+            "validated": True,
+            "validation_metric": "recall@5",
+            "validation_value": 0.3652590335219852,
+            "validation_trials": 2297,
+            "validation_scope": "restaurant:192",
+            "validation_source": "model_trials/model_comparison.csv",
+            "evaluation_version": "v1.1.0@test",
+        },
+        "time_period_key": "afternoon",
+        "time_period_ar": "العصر",
+        "selection_policy": "highest_validated_recall_at_fixed_k_then_deterministic_item_rank",
+    })
+    validation_catalog = {
+        "evaluation_version": "v1.1.0@test",
+        "empty_cart": {
+            "restaurant_popularity": {
+                "model_key": "restaurant_popularity",
+                "validated": True,
+                "validation_metric": "recall@10",
+                "validation_value": 0.5698,
+                "validation_trials": 67417,
+            },
+            "time_aware_popularity": {
+                "model_key": "time_aware_popularity",
+                "validated": True,
+                "validation_metric": "recall@10",
+                "validation_value": 0.5901,
+                "validation_trials": 67417,
+                "by_time_period": {
+                    "afternoon": {
+                        "validated": True,
+                        "validation_metric": "recall@10",
+                        "validation_value": 0.5139,
+                        "validation_trials": 9862,
+                    },
+                },
+            },
+        },
+    }
+
+    ranked = _apply_live_recommendation_rules(
+        result,
+        live_menu,
+        [99],
+        last_added_item_id=99,
+        validation_catalog=validation_catalog,
+    )
+
+    assert [item["item_id"] for item in ranked["top_recommendations"]] == [1]
+    item = ranked["top_recommendations"][0]
+    assert item["model_key"] == "fbt_confidence"
+    assert item["model_accuracy_percent"] == 36.53
+    assert item["accuracy_metric"] == "recall@5"
+    assert item["accuracy_validated"] is True
+    assert item["time_period_ar"] == "العصر"
+    assert [model["model_key"] for model in item["contributing_models"]] == [
+        "fbt_confidence",
+        "restaurant_popularity",
+        "time_aware_popularity",
+    ]
+    assert item["source_labels_ar"] == [
+        "حسب السلة كاملة",
+        "الأكثر طلبًا",
+        "الأكثر طلبًا في فترة العصر",
+    ]
+    assert ranked["sections"]["popular"] == []
+    assert ranked["sections"]["time_context"] == []
+    assert ranked["default_model_key"] == "fbt_confidence"
+    assert [model["model_key"] for model in ranked["models"]] == ["fbt_confidence"]
+
+
+def test_unvalidated_fallback_never_exposes_fake_accuracy():
+    live_menu = {"items": [_item(99, 1), _item(1, 2)]}
+    result = _result(
+        based_on_cart=[_rec(1, 0.25, "live_menu_fallback", "cross_sell")],
+    )
+    result["selected_model"] = {
+        "model_key": "live_menu_fallback",
+        "validated": False,
+        "validation_metric": None,
+        "validation_value": None,
+        "validation_trials": 0,
+    }
+
+    ranked = _apply_live_recommendation_rules(result, live_menu, [99])
+    item = ranked["top_recommendations"][0]
+
+    assert item["accuracy_validated"] is False
+    assert item["model_accuracy_percent"] is None
+    assert item["accuracy_metric"] is None

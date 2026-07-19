@@ -589,31 +589,21 @@ _CONTEXT_META = {
         "score_scale": 0.35,
     },
     "popular": {
-        "model_key": "popularity",
+        "model_key": "restaurant_popularity",
         "label_ar": "الأكثر طلبًا",
         "description_ar": "يرتب الأصناف الأكثر طلبًا في المطعم.",
         "score_label_ar": "قوة الطلب",
         "business_type": "popular",
         "score_scale": 0.25,
     },
-}
-
-_ENSEMBLE_META = {
-    "model_key": "ensemble",
-    "label_ar": "المزيج الذكي",
-    "description_ar": "يرتب نتائج السلة والارتباط والتشابه مع أولوية لإجماع المحركات.",
-}
-
-_CART_MODEL_CONTEXT_ORDER = [
-    "based_on_cart",
-    "based_on_last_item",
-    "similar_alternatives",
-]
-
-_ENSEMBLE_CONTEXT_WEIGHTS = {
-    "based_on_cart": 1.00,
-    "based_on_last_item": 0.82,
-    "similar_alternatives": 0.62,
+    "time_context": {
+        "model_key": "time_aware_popularity",
+        "label_ar": "الأكثر طلبًا في هذه الفترة",
+        "description_ar": "يرتب الطلب الفعلي في فترة اليوم الحالية بتوقيت الرياض.",
+        "score_label_ar": "قوة الطلب في الفترة",
+        "business_type": "popular",
+        "score_scale": 0.25,
+    },
 }
 
 _MODEL_ALLOWED_SOURCES = {
@@ -621,6 +611,21 @@ _MODEL_ALLOWED_SOURCES = {
     "based_on_last_item": {"restaurant_fbt", "pooled_fbt"},
     "similar_alternatives": {"item2vec"},
     "popular": {"restaurant_popularity", "global_common", "live_menu_fallback"},
+    "time_context": {"time_based"},
+}
+
+_MODEL_LABELS_AR = {
+    "fbt_confidence": "الارتباط حسب الثقة",
+    "fbt_hybrid": "الارتباط الهجين",
+    "fbt_paircount": "الارتباط حسب تكرار الطلب",
+    "fbt_lift": "الارتباط حسب قوة الرفع",
+    "time_aware_popularity": "الأكثر طلبًا في هذه الفترة",
+    "restaurant_popularity": "الأكثر طلبًا",
+    "item2vec": "التشابه السلوكي",
+    "pooled_fbt": "ارتباط المطاعم المشابهة",
+    "live_menu_fallback": "استكشاف المنيو المتاح",
+    "full_cart": "السلة كاملة",
+    "last_item": "آخر صنف",
 }
 
 
@@ -631,6 +636,8 @@ def _recommendation_context(section_name: str, item: dict) -> str:
         return section_name
     source = str(item.get("source") or "").lower()
     recommendation_type = str(item.get("recommendation_type") or "").lower()
+    if source == "time_based" or section_name == "time_context":
+        return "time_context"
     if source in {"restaurant_popularity", "global_common"} or recommendation_type == "popular":
         return "popular"
     if source == "item2vec" or recommendation_type == "similar_alternative":
@@ -663,7 +670,7 @@ def _calibrated_match_score(context: str, raw_score: float, max_score: float, ra
     base_signal = 1.0 - math.exp(-safe_raw / scale)
     relative_signal = min(safe_raw / max_score, 1.0) if max_score > 0 else 0.0
     rank_signal = max(0.0, 1.0 - (max(0, int(rank)) / 4.0))
-    if context == "popular":
+    if context in {"popular", "time_context"}:
         # Popularity is meaningful relative to the restaurant's own catalog.
         # Present it as demand strength, not as a raw purchase probability.
         calibrated = 0.58 + (0.34 * math.sqrt(relative_signal)) + (0.05 * rank_signal)
@@ -674,67 +681,171 @@ def _calibrated_match_score(context: str, raw_score: float, max_score: float, ra
     return float(round(max(1.0, min(calibrated * 100.0, 97.0))))
 
 
-def _balanced_model_results(pools: dict, contexts: list[str], limit: int) -> list[dict]:
-    """Blend cart models with full-cart priority and an agreement bonus."""
-    candidates = {}
-    priority_index = {context: index for index, context in enumerate(contexts)}
-    for context in contexts:
-        items = pools.get(context) or []
-        context_weight = _ENSEMBLE_CONTEXT_WEIGHTS.get(context, 0.5)
-        item_count = max(1, len(items))
-        for item in items:
-            item_id = int(item["item_id"])
-            rank = max(1, int(item.get("rank") or 1))
-            compatibility = float(item.get("compatibility_percent") or 0.0) / 100.0
-            rank_signal = max(0.0, 1.0 - ((rank - 1) / item_count))
-            weighted_signal = min(
-                0.97,
-                context_weight * ((0.85 * compatibility) + (0.15 * rank_signal)),
-            )
-            current = candidates.get(item_id)
-            if current is None:
-                candidates[item_id] = {
-                    "representative": item,
-                    "miss_probability": 1.0 - weighted_signal,
-                    "contexts": {context},
-                    "has_strong_signal": bool(item.get("meets_threshold")),
-                }
-                continue
-            current["miss_probability"] *= 1.0 - weighted_signal
-            current["contexts"].add(context)
-            current["has_strong_signal"] = (
-                current["has_strong_signal"] or bool(item.get("meets_threshold"))
-            )
-            current_context = current["representative"].get("recommendation_context")
-            if priority_index.get(context, 99) < priority_index.get(current_context, 99):
-                current["representative"] = item
+def _validation_percent(record: dict | None) -> float | None:
+    if not record or not record.get("validated"):
+        return None
+    if record.get("validation_percent") is not None:
+        value = float(record["validation_percent"])
+    elif record.get("validation_value") is not None:
+        value = float(record["validation_value"]) * 100.0
+    else:
+        return None
+    return round(max(0.0, min(value, 100.0)), 2)
 
-    ranked = []
-    for item_id, candidate in candidates.items():
-        contexts_count = len(candidate["contexts"])
-        combined_score = 1.0 - candidate["miss_probability"]
-        if candidate["has_strong_signal"]:
-            compatibility_percent = round(70.0 + (27.0 * combined_score))
-        else:
-            compatibility_percent = min(69, round(combined_score * 100.0))
-        compatibility_percent = max(1, min(97, compatibility_percent))
-        meets_threshold = compatibility_percent >= 70
-        representative = {
-            **candidate["representative"],
-            "model_agreement_count": contexts_count,
-            "compatibility_percent": float(compatibility_percent),
-            "confidence_band_ar": _confidence_band_ar(compatibility_percent),
-            "meets_threshold": meets_threshold,
+
+def _supporting_validation_record(
+    context: str,
+    validation_catalog: dict,
+    time_period_key: str | None,
+) -> dict:
+    if context == "popular":
+        record = ((validation_catalog.get("empty_cart") or {}).get("restaurant_popularity") or {})
+    elif context == "time_context":
+        record = dict(
+            ((validation_catalog.get("empty_cart") or {}).get("time_aware_popularity") or {})
+        )
+        if time_period_key:
+            period = (record.get("by_time_period") or {}).get(time_period_key)
+            if period:
+                record.update(period)
+        record["model_key"] = "time_aware_popularity"
+    elif context == "similar_alternatives":
+        record = ((validation_catalog.get("supporting_models") or {}).get("item2vec") or {})
+    else:
+        record = {}
+    return dict(record)
+
+
+def _provenance_descriptor(
+    context: str,
+    item: dict,
+    *,
+    selected_model: dict | None,
+    validation_catalog: dict,
+    time_period_key: str | None,
+    time_period_ar: str | None,
+    selected: bool,
+) -> dict:
+    source = str(item.get("source") or "unknown")
+    if selected:
+        record = dict(selected_model or {})
+    elif context in {"based_on_last_item", "based_on_cart"}:
+        record = dict(selected_model or {})
+    else:
+        record = _supporting_validation_record(context, validation_catalog, time_period_key)
+
+    if source in {"pooled_fbt", "live_menu_fallback", "global_common"}:
+        record = {
+            "model_key": source,
+            "validated": False,
+            "validation_metric": None,
+            "validation_value": None,
+            "validation_trials": 0,
+            "validation_scope": "unvalidated_fallback",
+            "validation_source": None,
         }
-        ranked.append((
-            combined_score,
-            priority_index.get(representative.get("recommendation_context"), len(contexts)),
-            int(representative.get("rank") or 1),
-            item_id,
-            representative,
-        ))
-    ranked.sort(key=lambda row: (-row[0], row[1], row[2], row[3]))
-    return [row[4] for row in ranked[:limit]]
+    model_key = str(record.get("model_key") or _CONTEXT_META[context]["model_key"])
+    descriptor = {
+        "model_key": model_key,
+        "label_ar": record.get("label_ar") or _MODEL_LABELS_AR.get(model_key, model_key),
+        "context_key": context,
+        "role": "selected" if selected else "supporting",
+        "source": source,
+        "validated": bool(record.get("validated")),
+        "validation_metric": record.get("validation_metric"),
+        "validation_percent": _validation_percent(record),
+        "validation_trials": max(0, int(record.get("validation_trials") or 0)),
+        "validation_scope": record.get("validation_scope"),
+        "validation_source": record.get("validation_source"),
+        "evaluation_version": (
+            record.get("evaluation_version") or validation_catalog.get("evaluation_version")
+        ),
+        "time_period_key": time_period_key if context == "time_context" else None,
+        "time_period_ar": time_period_ar if context == "time_context" else None,
+        "unavailable_reason": record.get("unavailable_reason"),
+    }
+    return descriptor
+
+
+def _source_label_ar(context: str, time_period_ar: str | None) -> str:
+    if context == "time_context":
+        return f"الأكثر طلبًا في فترة {time_period_ar}" if time_period_ar else "الأكثر طلبًا حسب الوقت"
+    return {
+        "based_on_cart": "حسب السلة كاملة",
+        "based_on_last_item": "حسب آخر صنف",
+        "similar_alternatives": "حسب التشابه السلوكي",
+        "popular": "الأكثر طلبًا",
+    }.get(context, context)
+
+
+def _annotate_provenance(
+    item: dict,
+    selected_context: str,
+    support_by_context: dict[str, dict[int, dict]],
+    *,
+    selected_model: dict | None,
+    validation_catalog: dict,
+    time_period_key: str | None,
+    time_period_ar: str | None,
+) -> dict:
+    item_id = int(item["item_id"])
+    contexts = [selected_context]
+    for context in (
+        "based_on_cart",
+        "based_on_last_item",
+        "similar_alternatives",
+        "popular",
+        "time_context",
+    ):
+        if context != selected_context and item_id in support_by_context.get(context, {}):
+            contexts.append(context)
+
+    descriptors = []
+    seen = set()
+    for context in contexts:
+        support_item = support_by_context.get(context, {}).get(item_id, item)
+        descriptor = _provenance_descriptor(
+            context,
+            support_item,
+            selected_model=selected_model,
+            validation_catalog=validation_catalog,
+            time_period_key=time_period_key,
+            time_period_ar=time_period_ar,
+            selected=context == selected_context,
+        )
+        key = (descriptor["model_key"], descriptor["context_key"])
+        if key in seen:
+            continue
+        seen.add(key)
+        descriptors.append(descriptor)
+
+    selected_descriptor = descriptors[0]
+    supporting = descriptors[1:]
+    labels = [_source_label_ar(context, time_period_ar) for context in contexts]
+    annotated = {
+        **item,
+        "model_key": selected_descriptor["model_key"],
+        "model_label_ar": selected_descriptor["label_ar"],
+        "selected_model": selected_descriptor,
+        "supporting_models": supporting,
+        "contributing_models": descriptors,
+        "source_labels_ar": labels,
+        "model_accuracy_percent": selected_descriptor["validation_percent"],
+        "accuracy_metric": selected_descriptor["validation_metric"],
+        "model_accuracy_metric": selected_descriptor["validation_metric"],
+        "accuracy_validated": selected_descriptor["validated"],
+        "time_period_key": time_period_key if "time_context" in contexts else None,
+        "time_period_ar": time_period_ar if "time_context" in contexts else None,
+        "model_agreement_count": len(descriptors),
+    }
+    if supporting:
+        support_text = " + ".join(label for label in labels[1:] if label)
+        if support_text:
+            annotated["reason"] = " · ".join(
+                part for part in [str(item.get("reason") or "").strip(), f"مدعوم أيضًا بـ {support_text}"]
+                if part
+            )
+    return annotated
 
 
 def _apply_live_recommendation_rules(
@@ -744,6 +855,7 @@ def _apply_live_recommendation_rules(
     last_added_item_id=None,
     previous_top_item_id=None,
     display_limit: int = 5,
+    validation_catalog: dict | None = None,
 ):
     live_items = {int(item["item_id"]): item for item in live_menu["items"]}
     cart_list = _unique_positive_ints(cart_item_ids)
@@ -767,10 +879,16 @@ def _apply_live_recommendation_rules(
         "already_in_cart": 0,
         "same_category_as_last_item": 0,
         "popular_after_cart": 0,
+        "time_only_after_cart": 0,
         "model_source_mismatch": 0,
     }
 
-    for section_name, section_items in (result.get("sections") or {}).items():
+    input_sections = {
+        key: list(value or []) for key, value in (result.get("sections") or {}).items()
+    }
+    for key, value in (result.get("supporting_sections") or {}).items():
+        input_sections.setdefault(key, []).extend(value or [])
+    for section_name, section_items in input_sections.items():
         for raw_item in section_items or []:
             item_id = int(raw_item["item_id"])
             if previous_top is not None and item_id == previous_top:
@@ -788,9 +906,6 @@ def _apply_live_recommendation_rules(
                 continue
 
             context = _recommendation_context(section_name, raw_item)
-            if has_cart and context == "popular":
-                skipped["popular_after_cart"] += 1
-                continue
             category_id = live_item.get("category_id")
             if (
                 has_cart
@@ -821,12 +936,6 @@ def _apply_live_recommendation_rules(
                 "availability_reason": live_item.get("availability_reason"),
             })
 
-    if not has_cart:
-        for context in ("based_on_cart", "based_on_last_item", "similar_alternatives"):
-            pools[context] = []
-    else:
-        pools["popular"] = []
-
     for context, items in pools.items():
         items.sort(key=lambda item: (-float(item.get("score") or 0.0), int(item["item_id"])))
         safe_scores = [max(0.0, float(item.get("score") or 0.0)) for item in items]
@@ -841,7 +950,6 @@ def _apply_live_recommendation_rules(
             # calibrator, so do not present these values as purchase probabilities.
             item["probability_percent"] = None
 
-    priority = _CART_MODEL_CONTEXT_ORDER if has_cart else ["popular"]
     max_results = max(1, min(int(display_limit or 5), 5))
     visible_pools = {}
     strong_pools = {}
@@ -852,72 +960,83 @@ def _apply_live_recommendation_rules(
         model_fallbacks[context] = bool(items and not strong)
         visible_pools[context] = (strong or items)[:max_results]
 
-    agreement_counts = {}
-    for context in priority:
-        for item in visible_pools[context]:
-            item_id = int(item["item_id"])
-            agreement_counts[item_id] = agreement_counts.get(item_id, 0) + 1
-    for items in pools.values():
-        for item in items:
-            item["model_agreement_count"] = agreement_counts.get(int(item["item_id"]), 1)
-
-    has_strong_recommendations = any(strong_pools[context] for context in priority)
-    if has_strong_recommendations:
-        strong_item_ids = {
-            int(item["item_id"])
-            for context in priority
-            for item in strong_pools[context]
-        }
-        # Keep weaker corroborating signals for an otherwise strong candidate,
-        # while preventing weak-only candidates from polluting the ensemble.
-        ensemble_pools = {
-            context: [
-                item
-                for item in visible_pools[context]
-                if int(item["item_id"]) in strong_item_ids
-            ]
-            for context in priority
-        }
+    selected_model = dict(result.get("selected_model") or {})
+    selected_key = str(selected_model.get("model_key") or "")
+    if has_cart:
+        selected_context = "based_on_cart"
+    elif selected_key == "time_aware_popularity" and visible_pools["time_context"]:
+        selected_context = "time_context"
     else:
-        ensemble_pools = visible_pools
-    top_recommendations = (
-        _balanced_model_results(ensemble_pools, priority, max_results)
-        if has_cart
-        else list(ensemble_pools["popular"][:max_results])
+        selected_context = "popular"
+
+    selected_items = visible_pools[selected_context]
+    if not selected_items and selected_context != "popular" and not has_cart:
+        selected_context = "popular"
+        selected_items = visible_pools["popular"]
+
+    support_by_context = {
+        context: {int(item["item_id"]): item for item in items}
+        for context, items in pools.items()
+    }
+    validation_catalog = dict(validation_catalog or {})
+    time_period_key = result.get("time_period_key")
+    time_period_ar = result.get("time_period_ar")
+    top_recommendations = [
+        _annotate_provenance(
+            item,
+            selected_context,
+            support_by_context,
+            selected_model=selected_model,
+            validation_catalog=validation_catalog,
+            time_period_key=time_period_key,
+            time_period_ar=time_period_ar,
+        )
+        for item in selected_items[:max_results]
+    ]
+    selected_has_strong = bool(strong_pools[selected_context])
+    threshold_fallback_used = bool(top_recommendations and not selected_has_strong)
+
+    selected_descriptor = (
+        top_recommendations[0].get("selected_model") if top_recommendations else None
     )
-    threshold_fallback_used = bool(top_recommendations and not has_strong_recommendations)
+    model_key = (
+        selected_descriptor.get("model_key") if selected_descriptor
+        else selected_key or _CONTEXT_META[selected_context]["model_key"]
+    )
+    model_label = (
+        selected_descriptor.get("label_ar") if selected_descriptor
+        else _MODEL_LABELS_AR.get(model_key, model_key)
+    )
+    models = [{
+        "model_key": model_key,
+        "label_ar": model_label,
+        "description_ar": _CONTEXT_META[selected_context]["description_ar"],
+        "available": bool(top_recommendations),
+        "threshold_fallback_used": threshold_fallback_used,
+        "suggestions": top_recommendations,
+        "selected": True,
+        "validated": bool(selected_descriptor and selected_descriptor.get("validated")),
+        "validation_metric": selected_descriptor.get("validation_metric") if selected_descriptor else None,
+        "validation_percent": selected_descriptor.get("validation_percent") if selected_descriptor else None,
+        "validation_trials": selected_descriptor.get("validation_trials", 0) if selected_descriptor else 0,
+        "validation_scope": selected_descriptor.get("validation_scope") if selected_descriptor else None,
+        "evaluation_version": selected_descriptor.get("evaluation_version") if selected_descriptor else None,
+    }]
+    default_model_key = model_key
 
     if has_cart:
-        models = [{
-            **_ENSEMBLE_META,
-            "available": bool(top_recommendations),
-            "description_ar": _ENSEMBLE_META["description_ar"],
-            "threshold_fallback_used": threshold_fallback_used,
-            "suggestions": top_recommendations,
-        }]
-        for context in _CART_MODEL_CONTEXT_ORDER:
-            meta = _CONTEXT_META[context]
-            suggestions = visible_pools[context]
-            models.append({
-                "model_key": meta["model_key"],
-                "label_ar": meta["label_ar"],
-                "description_ar": meta["description_ar"],
-                "available": bool(suggestions),
-                "threshold_fallback_used": model_fallbacks[context],
-                "suggestions": suggestions,
-            })
-        default_model_key = "ensemble"
+        selected_ids = {int(item["item_id"]) for item in selected_items}
+        skipped["popular_after_cart"] += sum(
+            1 for item in pools["popular"] if int(item["item_id"]) not in selected_ids
+        )
+        skipped["time_only_after_cart"] += sum(
+            1 for item in pools["time_context"] if int(item["item_id"]) not in selected_ids
+        )
+        pools["popular"] = []
+        pools["time_context"] = []
     else:
-        popular_meta = _CONTEXT_META["popular"]
-        models = [{
-            "model_key": popular_meta["model_key"],
-            "label_ar": popular_meta["label_ar"],
-            "description_ar": popular_meta["description_ar"],
-            "available": bool(top_recommendations),
-            "threshold_fallback_used": threshold_fallback_used,
-            "suggestions": top_recommendations,
-        }]
-        default_model_key = "popularity"
+        for context in ("based_on_cart", "based_on_last_item", "similar_alternatives"):
+            pools[context] = []
 
     warnings = list(result.get("warnings") or [])
     for reason, count in skipped.items():
@@ -940,6 +1059,43 @@ def _apply_live_recommendation_rules(
     result["warnings"] = warnings
     result["threshold_percent"] = 70.0
     result["threshold_fallback_used"] = threshold_fallback_used
+    result["selected_model"] = selected_descriptor or selected_model or None
+    supporting_models = []
+    supporting_seen = set()
+    for item in top_recommendations:
+        for descriptor in item.get("supporting_models") or []:
+            key = (descriptor.get("model_key"), descriptor.get("context_key"))
+            if key in supporting_seen:
+                continue
+            supporting_seen.add(key)
+            supporting_models.append(descriptor)
+    result["supporting_models"] = supporting_models
+    personalized = dict(validation_catalog.get("personalized") or {})
+    result["unavailable_models"] = []
+    if personalized and not personalized.get("validated"):
+        personalized_key = str(personalized.get("model_key") or "personalized")
+        result["unavailable_models"].append({
+            "model_key": personalized_key,
+            "label_ar": "التخصيص حسب المستخدم",
+            "context_key": "personalized",
+            "role": "supporting",
+            "source": None,
+            "validated": False,
+            "validation_metric": None,
+            "validation_percent": None,
+            "validation_trials": 0,
+            "validation_scope": personalized.get("validation_scope"),
+            "validation_source": personalized.get("validation_source"),
+            "evaluation_version": validation_catalog.get("evaluation_version"),
+            "time_period_key": None,
+            "time_period_ar": None,
+            "unavailable_reason": personalized.get("unavailable_reason"),
+        })
+    result["selection_policy"] = (
+        result.get("selection_policy")
+        or validation_catalog.get("selection_policy")
+        or "deterministic_selected_model_without_score_blending"
+    )
     result["fallback_used"] = bool(
         result.get("fallback_used")
         or threshold_fallback_used
@@ -958,13 +1114,15 @@ def _build_widget_recommendations(req: WidgetRecommendationRequest, request: Req
         include_inactive=False,
         fresh=False,
     )
-    result = load_model().recommend(
+    model = load_model()
+    result = model.recommend(
         restaurant_id=req.restaurant_id,
         cart_item_ids=list(req.cart_item_ids),
         last_added_item_id=req.last_added_item_id,
         limit=req.limit,
         previous_top_item_id=req.previous_top_item_id,
         live_candidates=live_menu["items"],
+        context=dict(req.context or {}),
     )
     result = _apply_live_recommendation_rules(
         result,
@@ -973,6 +1131,7 @@ def _build_widget_recommendations(req: WidgetRecommendationRequest, request: Req
         last_added_item_id=req.last_added_item_id,
         previous_top_item_id=req.previous_top_item_id,
         display_limit=req.limit,
+        validation_catalog=dict(model.metadata.get("validated_model_selection") or {}),
     )
     latency_ms = round(1000 * (time.perf_counter() - t0), 2)
     result["request_id"] = request.state.request_id

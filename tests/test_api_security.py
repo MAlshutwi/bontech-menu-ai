@@ -102,8 +102,10 @@ def test_widget_api_accepts_empty_cart_and_unknowns():
     assert empty.status_code == 200
     empty_body = empty.json()
     assert empty_body["fallback_used"] is True
-    assert empty_body["default_model_key"] == "popularity"
-    assert [model["model_key"] for model in empty_body["models"]] == ["popularity"]
+    assert empty_body["default_model_key"] == "time_aware_popularity"
+    assert [model["model_key"] for model in empty_body["models"]] == ["time_aware_popularity"]
+    assert empty_body["selected_model"]["validated"] is True
+    assert empty_body["selected_model"]["validation_metric"] == "recall@10"
 
     live_only_rest = c.post("/api/v1/recommendations", json={
         "restaurant_id": LIVE_ONLY_RID,
@@ -173,16 +175,18 @@ def test_widget_api_supports_last_item_and_cart_sections():
     assert body["sections"]["based_on_cart"]
     assert len(body["top_recommendations"]) <= 5
     assert body["sections"]["based_on_last_item"][0]["evidence"].get("with_item") == 10153
-    assert body["default_model_key"] == "ensemble"
-    assert [model["model_key"] for model in body["models"]] == [
-        "ensemble",
-        "full_cart",
-        "last_item",
-        "similarity",
-    ]
-    assert "popularity" not in body["available_model_keys"]
+    assert body["default_model_key"] == body["selected_model"]["model_key"]
+    assert [model["model_key"] for model in body["models"]] == [body["default_model_key"]]
+    assert body["selected_model"]["validated"] is True
+    assert body["selected_model"]["validation_metric"] == "recall@5"
     assert body["sections"]["popular"] == []
-    assert len({item["model_key"] for item in body["top_recommendations"]}) >= 2
+    assert body["sections"]["time_context"] == []
+    assert {item["model_key"] for item in body["top_recommendations"]} == {
+        body["default_model_key"]
+    }
+    assert all(item["contributing_models"] for item in body["top_recommendations"])
+    assert all(item["source_labels_ar"] for item in body["top_recommendations"])
+    assert all(item["accuracy_validated"] for item in body["top_recommendations"])
     assert all(item["type_label_ar"] for item in body["top_recommendations"])
     assert all(1 <= item["compatibility_percent"] <= 99 for item in body["top_recommendations"])
     assert all(item["probability_percent"] is None for item in body["top_recommendations"])

@@ -28,8 +28,8 @@ class RecommendationRequest(BaseModel):
     cart_item_ids: List[StrictInt] = Field(default_factory=list)
     top_k: StrictInt = Field(5, ge=1, le=50)
     include_types: Optional[
-        List[Literal["cross_sell", "similar_alternative", "popular"]]
-    ] = Field(None, min_length=1, max_length=3)
+        List[Literal["cross_sell", "similar_alternative", "popular", "time_based"]]
+    ] = Field(None, min_length=1, max_length=4)
     context: Optional[RequestContext] = None
 
     @field_validator("cart_item_ids")
@@ -93,6 +93,24 @@ class WidgetRecommendationRequest(BaseModel):
         return value
 
 
+class WidgetModelProvenance(BaseModel):
+    model_key: str
+    label_ar: str = ""
+    context_key: Optional[str] = None
+    role: Literal["selected", "supporting"] = "supporting"
+    source: Optional[str] = None
+    validated: bool = False
+    validation_metric: Optional[str] = None
+    validation_percent: Optional[float] = Field(None, ge=0.0, le=100.0)
+    validation_trials: int = Field(0, ge=0)
+    validation_scope: Optional[str] = None
+    validation_source: Optional[str] = None
+    evaluation_version: Optional[str] = None
+    time_period_key: Optional[str] = None
+    time_period_ar: Optional[str] = None
+    unavailable_reason: Optional[str] = None
+
+
 class WidgetRecommendationItem(BaseModel):
     item_id: int
     title_ar: str = ""
@@ -118,6 +136,16 @@ class WidgetRecommendationItem(BaseModel):
     meets_threshold: bool = False
     is_available: bool = True
     availability_reason: Optional[str] = None
+    selected_model: Optional[WidgetModelProvenance] = None
+    supporting_models: List[WidgetModelProvenance] = Field(default_factory=list)
+    contributing_models: List[WidgetModelProvenance] = Field(default_factory=list)
+    source_labels_ar: List[str] = Field(default_factory=list)
+    model_accuracy_percent: Optional[float] = Field(None, ge=0.0, le=100.0)
+    accuracy_metric: Optional[str] = None
+    model_accuracy_metric: Optional[str] = None
+    accuracy_validated: bool = False
+    time_period_key: Optional[str] = None
+    time_period_ar: Optional[str] = None
 
 
 class WidgetRecommendationSections(BaseModel):
@@ -125,6 +153,7 @@ class WidgetRecommendationSections(BaseModel):
     based_on_cart: List[WidgetRecommendationItem] = Field(default_factory=list)
     similar_alternatives: List[WidgetRecommendationItem] = Field(default_factory=list)
     popular: List[WidgetRecommendationItem] = Field(default_factory=list)
+    time_context: List[WidgetRecommendationItem] = Field(default_factory=list)
 
 
 class WidgetRecommendationModelGroup(BaseModel):
@@ -134,6 +163,13 @@ class WidgetRecommendationModelGroup(BaseModel):
     available: bool = False
     threshold_fallback_used: bool = False
     suggestions: List[WidgetRecommendationItem] = Field(default_factory=list)
+    selected: bool = False
+    validated: bool = False
+    validation_metric: Optional[str] = None
+    validation_percent: Optional[float] = Field(None, ge=0.0, le=100.0)
+    validation_trials: int = Field(0, ge=0)
+    validation_scope: Optional[str] = None
+    evaluation_version: Optional[str] = None
 
 
 class WidgetRecommendationResponse(BaseModel):
@@ -153,6 +189,12 @@ class WidgetRecommendationResponse(BaseModel):
     disabled_reason: Optional[str] = None
     threshold_percent: float = 70.0
     threshold_fallback_used: bool = False
+    selected_model: Optional[WidgetModelProvenance] = None
+    supporting_models: List[WidgetModelProvenance] = Field(default_factory=list)
+    selection_policy: Optional[str] = None
+    time_period_key: Optional[str] = None
+    time_period_ar: Optional[str] = None
+    unavailable_models: List[WidgetModelProvenance] = Field(default_factory=list)
 
 
 class HealthResponse(BaseModel):

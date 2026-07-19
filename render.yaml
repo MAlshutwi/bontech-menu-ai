@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: bontech-menu-ai
+    name: bontech-menu-ai-v2
     runtime: docker
     plan: free
     autoDeployTrigger: checksPass
@@ -13,7 +13,7 @@ services:
       - key: BONTECH_MODEL_FILE
         value: /app/ToCoun/Final/bontech_recommendation_model_v1_1_0.joblib
       - key: BONTECH_MODEL_SHA256
-        value: 6b86348e70d5889eb79def8f115878763f0168bd9cc1bc8e797755ad20c320e5
+        value: 061aa95de23e5fb50529bcde3a2f0ded818294cae57a4cf2fd99ae72e9e82cc4
       - key: DB_HOST
         sync: false
       - key: DB_PORT
