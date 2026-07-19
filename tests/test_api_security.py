@@ -71,6 +71,18 @@ def stub_live_database(monkeypatch):
 
     monkeypatch.setattr(main_module, "_live_menu_payload", fake_live_menu)
     monkeypatch.setattr(main_module, "_database_readiness", lambda fresh=False: (True, "test"))
+    monkeypatch.setattr(main_module, "_current_trend_payload", lambda *args, **kwargs: {
+        "model_key": "current_trend_momentum",
+        "status": "unavailable",
+        "why_ar": "لا توجد بيانات حديثة في الاختبار.",
+        "unavailable_reason": "no_recent_orders",
+        "items": [],
+        "data_as_of": "2026-07-19T12:00:00+00:00",
+        "latest_order_at": None,
+        "freshness_status": "no_data",
+        "scope": None,
+        "is_forecast": False,
+    })
 
 
 def client():
@@ -103,7 +115,9 @@ def test_widget_api_accepts_empty_cart_and_unknowns():
     empty_body = empty.json()
     assert empty_body["fallback_used"] is True
     assert empty_body["default_model_key"] == "time_aware_popularity"
-    assert [model["model_key"] for model in empty_body["models"]] == ["time_aware_popularity"]
+    assert [model["context_key"] for model in empty_body["models"]] == [
+        "full_cart", "last_item", "popularity", "current_trend", "user",
+    ]
     assert empty_body["selected_model"]["validated"] is True
     assert empty_body["selected_model"]["validation_metric"] == "recall@10"
 
@@ -117,7 +131,9 @@ def test_widget_api_accepts_empty_cart_and_unknowns():
     assert live_only_body["disabled_reason"] is None
     assert live_only_body["sections"]["based_on_cart"]
     assert all(item["source"] == "live_menu_fallback" for item in live_only_body["sections"]["based_on_cart"])
-    assert live_only_body["sections"]["popular"] == []
+    assert next(
+        group for group in live_only_body["models"] if group["context_key"] == "full_cart"
+    )["status"] == "fallback"
 
     unknown_item = c.post("/api/v1/recommendations", json={
         "restaurant_id": RID,
@@ -176,11 +192,13 @@ def test_widget_api_supports_last_item_and_cart_sections():
     assert len(body["top_recommendations"]) <= 5
     assert body["sections"]["based_on_last_item"][0]["evidence"].get("with_item") == 10153
     assert body["default_model_key"] == body["selected_model"]["model_key"]
-    assert [model["model_key"] for model in body["models"]] == [body["default_model_key"]]
+    assert [model["context_key"] for model in body["models"]] == [
+        "full_cart", "last_item", "popularity", "current_trend", "user",
+    ]
     assert body["selected_model"]["validated"] is True
     assert body["selected_model"]["validation_metric"] == "recall@5"
-    assert body["sections"]["popular"] == []
-    assert body["sections"]["time_context"] == []
+    assert body["sections"]["popular"]
+    assert body["sections"]["time_context"]
     assert {item["model_key"] for item in body["top_recommendations"]} == {
         body["default_model_key"]
     }
@@ -191,6 +209,51 @@ def test_widget_api_supports_last_item_and_cart_sections():
     assert all(1 <= item["compatibility_percent"] <= 99 for item in body["top_recommendations"])
     assert all(item["probability_percent"] is None for item in body["top_recommendations"])
     assert all(float(item["compatibility_percent"]).is_integer() for item in body["top_recommendations"])
+
+
+def test_widget_api_serializes_current_trend_without_fake_percent(monkeypatch):
+    monkeypatch.setattr(main_module, "_current_trend_payload", lambda *args, **kwargs: {
+        "model_key": "current_trend_momentum",
+        "status": "available",
+        "why_ar": "رصد وصفي حديث وليس توقعًا.",
+        "unavailable_reason": None,
+        "items": [{
+            "item_id": SEED,
+            "title_ar": "",
+            "title_en": "Trend item",
+            "score": 2.5,
+            "source": "current_trend_nowcast",
+            "recommendation_type": "current_trend",
+            "reason": "ارتفاع مرصود فقط.",
+            "evidence": {
+                "observation_type": "current_nowcast_not_forecast",
+                "score_is_probability": False,
+                "recent_order_count": 8,
+                "baseline_order_count": 4,
+            },
+            "addable": True,
+            "disabled_reason": None,
+        }],
+        "data_as_of": "2026-07-19T12:00:00+00:00",
+        "latest_order_at": "2026-07-19T11:00:00+00:00",
+        "freshness_status": "fresh",
+        "scope": "same_time_period",
+        "is_forecast": False,
+    })
+
+    response = client().post("/api/v1/recommendations", json={
+        "restaurant_id": RID,
+        "cart_item_ids": [],
+    })
+
+    assert response.status_code == 200
+    trend = next(group for group in response.json()["models"] if group["context_key"] == "current_trend")
+    assert trend["status"] == "available"
+    assert trend["future_ready"] is False
+    assert trend["validated"] is False
+    assert trend["validation_percent"] is None
+    assert trend["suggestions"][0]["compatibility_percent"] is None
+    assert trend["suggestions"][0]["probability_percent"] is None
 
 
 def test_widget_api_method_safety():

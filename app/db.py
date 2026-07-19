@@ -109,6 +109,76 @@ def fetch_clean_lines_cached(refresh: bool = False) -> pd.DataFrame:
     return frame
 
 
+def fetch_restaurant_trend_counts(restaurant_id: int) -> pd.DataFrame:
+    """Fetch live 7-day versus prior-28-day order counts by item and day period."""
+    return q(
+        f"""
+        WITH latest_order AS (
+            SELECT MAX(ro.orderdate) AS latest_order_at
+            FROM reservation r
+            JOIN reservationorder ro ON ro.reservationid = r.id
+            WHERE r.restaurantsid = :restaurant_id
+              AND ro.canceledate IS NULL
+              AND ro.isdeleted = false
+        ),
+        recent_lines AS (
+            SELECT mir.reservationorderid AS order_id,
+                   mir.menuitemid AS item_id,
+                   ro.orderdate AS order_date,
+                   CASE
+                       WHEN EXTRACT(HOUR FROM ro.orderdate) >= 6
+                        AND EXTRACT(HOUR FROM ro.orderdate) < 11 THEN 'breakfast'
+                       WHEN EXTRACT(HOUR FROM ro.orderdate) >= 11
+                        AND EXTRACT(HOUR FROM ro.orderdate) < 16 THEN 'lunch'
+                       WHEN EXTRACT(HOUR FROM ro.orderdate) >= 16
+                        AND EXTRACT(HOUR FROM ro.orderdate) < 19 THEN 'afternoon'
+                       WHEN EXTRACT(HOUR FROM ro.orderdate) >= 19
+                         OR EXTRACT(HOUR FROM ro.orderdate) < 1 THEN 'dinner'
+                       WHEN EXTRACT(HOUR FROM ro.orderdate) >= 1
+                        AND EXTRACT(HOUR FROM ro.orderdate) < 6 THEN 'late_night'
+                       ELSE 'unknown'
+                   END AS time_period_key
+            FROM menuitemreservation mir
+            JOIN reservationorder ro ON ro.id = mir.reservationorderid
+            JOIN reservation r ON r.id = ro.reservationid
+            WHERE {_clean_where()}
+              AND r.restaurantsid = :restaurant_id
+              AND ro.orderdate >= CURRENT_TIMESTAMP - INTERVAL '35 days'
+              AND ro.orderdate <= CURRENT_TIMESTAMP
+        ),
+        item_counts AS (
+            SELECT item_id,
+                   time_period_key,
+                   COUNT(DISTINCT order_id) FILTER (
+                       WHERE order_date >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+                   ) AS recent_orders,
+                   COUNT(DISTINCT order_id) FILTER (
+                       WHERE order_date >= CURRENT_TIMESTAMP - INTERVAL '35 days'
+                         AND order_date < CURRENT_TIMESTAMP - INTERVAL '7 days'
+                   ) AS baseline_orders
+            FROM recent_lines
+            GROUP BY item_id, time_period_key
+            HAVING COUNT(DISTINCT order_id) FILTER (
+                WHERE order_date >= CURRENT_TIMESTAMP - INTERVAL '7 days'
+            ) > 0
+        )
+        SELECT counts.item_id,
+               counts.time_period_key,
+               counts.recent_orders,
+               counts.baseline_orders,
+               latest.latest_order_at,
+               CURRENT_TIMESTAMP AS data_as_of
+        FROM (SELECT 1 AS join_key) anchor
+        LEFT JOIN latest_order latest ON true
+        LEFT JOIN item_counts counts ON true
+        ORDER BY counts.time_period_key NULLS LAST,
+                 counts.recent_orders DESC NULLS LAST,
+                 counts.item_id NULLS LAST
+        """,
+        restaurant_id=int(restaurant_id),
+    )
+
+
 def fetch_order_customer_map() -> pd.DataFrame:
     return q("""
         SELECT DISTINCT reservationorderid AS order_id, usersid AS customer_id

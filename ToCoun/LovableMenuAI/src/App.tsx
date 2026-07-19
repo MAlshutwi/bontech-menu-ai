@@ -14,14 +14,25 @@ import type {
   MenuSize,
   Restaurant,
   RestaurantMenuResponse,
+  RecommendationContributingModel,
   RecommendationEventType,
+  RecommendationPathContext,
+  RecommendationPathStatus,
   WidgetRecommendationItem,
   WidgetRecommendationModelGroup,
+  WidgetRecommendationResponse,
 } from "./types/menu";
 
 const DEFAULT_RESTAURANT_ID = 192;
 const QUICK_RESTAURANT_IDS = [260, 277];
-type RecommendationModelKey = WidgetRecommendationModelGroup["model_key"];
+
+interface RecommendationPathGroup extends WidgetRecommendationModelGroup {
+  context_key: RecommendationPathContext;
+  status: RecommendationPathStatus;
+  why_ar: string;
+  unavailable_reason: string | null;
+  selected_model?: RecommendationContributingModel | null;
+}
 
 interface RecommendationTrace {
   requestId: string;
@@ -67,6 +78,7 @@ const MODEL_LABELS_AR: Record<string, string> = {
   time_context: "مودل الفترة الزمنية",
   time_popularity: "مودل الأكثر مبيعًا حسب الوقت",
   time_aware_popularity: "الأكثر مبيعًا حسب الفترة الزمنية",
+  current_trend_momentum: "مودل الترند الحالي",
   restaurant_popularity: "الأكثر مبيعًا في المطعم",
   fbt_confidence: "ارتباط السلة حسب الثقة",
   fbt_hybrid: "ارتباط السلة الهجين",
@@ -76,6 +88,7 @@ const MODEL_LABELS_AR: Record<string, string> = {
   pooled_fbt: "ارتباط السلة العام",
   live_menu_fallback: "اختيار متاح من المنيو",
   personalized: "مودل المستخدم",
+  user_affinity: "مودل تفضيلات المستخدم",
 };
 
 const TIME_PERIODS_AR: Record<string, string> = {
@@ -89,6 +102,133 @@ const TIME_PERIODS_AR: Record<string, string> = {
   dinner: "الليل",
   late_night: "آخر الليل",
 };
+
+const RECOMMENDATION_PATHS: Array<{
+  context_key: RecommendationPathContext;
+  label_ar: string;
+  description_ar: string;
+  fallback_model_key: string;
+}> = [
+  {
+    context_key: "full_cart",
+    label_ar: "حسب السلة كاملة",
+    description_ar: "يربط جميع أصناف السلة بالأصناف التي تُطلب معها.",
+    fallback_model_key: "full_cart",
+  },
+  {
+    context_key: "last_item",
+    label_ar: "ارتباط آخر عنصر",
+    description_ar: "يركّز على آخر صنف تمت إضافته إلى السلة.",
+    fallback_model_key: "last_item",
+  },
+  {
+    context_key: "popularity",
+    label_ar: "الأكثر طلبًا",
+    description_ar: "يعتمد على ترتيب الطلبات الفعلية داخل المطعم.",
+    fallback_model_key: "restaurant_popularity",
+  },
+  {
+    context_key: "current_trend",
+    label_ar: "الترند الحالي",
+    description_ar: "يرصد ارتفاع الطلب خلال آخر 7 أيام مقارنة بالـ28 يومًا السابقة.",
+    fallback_model_key: "current_trend_momentum",
+  },
+  {
+    context_key: "user",
+    label_ar: "حسب المستخدم",
+    description_ar: "يستخدم سجل المستخدم المصرّح به عندما تتوفر بيانات كافية.",
+    fallback_model_key: "personalized",
+  },
+];
+
+function normalizePathContext(value: string | null | undefined): RecommendationPathContext | null {
+  return ({
+    full_cart: "full_cart",
+    based_on_cart: "full_cart",
+    last_item: "last_item",
+    based_on_last_item: "last_item",
+    popularity: "popularity",
+    popular: "popularity",
+    restaurant_popularity: "popularity",
+    current_trend: "current_trend",
+    current_trend_momentum: "current_trend",
+    user: "user",
+    personalized: "user",
+  } as Record<string, RecommendationPathContext>)[value || ""] || null;
+}
+
+function contributorObject(value: RecommendationContributingModel | null | undefined) {
+  return value && typeof value === "object" ? value : null;
+}
+
+function unavailableReasonAr(
+  reason: string | null | undefined,
+  context: RecommendationPathContext,
+  hasCart: boolean,
+) {
+  const normalized = (reason || "").trim();
+  const knownReasons: Record<string, string> = {
+    cart_required: "أضف صنفًا إلى السلة لتفعيل هذا المسار.",
+    empty_cart: "أضف صنفًا إلى السلة لتفعيل هذا المسار.",
+    last_item_required: "أضف صنفًا جديدًا حتى نعرف آخر عنصر في السلة.",
+    insufficient_data: "لا توجد بيانات كافية وموثّقة لهذا المسار حاليًا.",
+    insufficient_user_history: "لا يوجد سجل طلبات كافٍ لهذا المستخدم بعد.",
+    user_identity_required: "يلزم معرّف مستخدم مصرح به لتفعيل التخصيص.",
+    no_user_identity: "يلزم معرّف مستخدم مصرح به لتفعيل التخصيص.",
+    model_not_validated: "المودل غير موثّق بالتقييم بعد، لذلك لن نعرض نتيجته.",
+    no_eligible_live_recommendations: "لا يوجد اقتراح متاح بعد فحص المنيو والمخزون.",
+    stale_order_history: "سجل الطلبات قديم ولا يمثل الترند الحالي.",
+    no_order_history: "لا يوجد سجل طلبات يمكن استخدامه لرصد الترند.",
+    no_recent_orders: "لا توجد طلبات حديثة خلال نافذة الرصد الحالية.",
+    insufficient_same_period_observations: "لا توجد ملاحظات حديثة كافية للمقارنة في الفترة نفسها.",
+    customer_identifier_not_provided: "لم يصل معرّف مستخدم مصرح به، لذلك مسار المستخدم غير متاح.",
+    insufficient_validated_customer_order_linkage: "لا يوجد ربط موثّق وكافٍ بين المستخدم وطلباته لتشغيل التخصيص.",
+  };
+  if (knownReasons[normalized]) return knownReasons[normalized];
+  if (normalized.startsWith("no_observed_growth")) {
+    return "البيانات حديثة، لكن لم يُرصد ارتفاع طلب يتجاوز حد الدعم الأدنى حاليًا.";
+  }
+  if (normalized && /[\u0600-\u06ff]/.test(normalized)) return normalized;
+  if (context === "user") return "التخصيص غير متاح حتى يصل معرّف المستخدم وسجل طلباته بشكل مصرح وآمن.";
+  if ((context === "full_cart" || context === "last_item") && !hasCart) {
+    return "أضف صنفًا إلى السلة لتفعيل هذا المسار.";
+  }
+  if (context === "current_trend") return "لا توجد بيانات زمنية كافية لهذه الفترة حاليًا.";
+  return "لا يوجد اقتراح مؤهل من هذا المسار بعد فحص المنيو والمخزون.";
+}
+
+function pathStatusLabel(group: RecommendationPathGroup) {
+  if (group.selected && (group.status === "available" || group.status === "fallback")) return "المختار";
+  if (group.status === "fallback") return "احتياطي";
+  if (group.status === "available") return "داعم";
+  if (group.status === "stale") return "بيانات قديمة";
+  return "غير متاح";
+}
+
+function formatOrderTimestamp(value: string | null | undefined) {
+  if (!value) return "وقت غير معروف";
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return value;
+  return new Intl.DateTimeFormat("ar-SA", {
+    dateStyle: "medium",
+    timeStyle: "short",
+    timeZone: "Asia/Riyadh",
+  }).format(parsed);
+}
+
+function staleTrendReasonAr(reason: string | null | undefined, latestOrderAt: string | null | undefined) {
+  const translated = unavailableReasonAr(reason || "stale_order_history", "current_trend", false);
+  const lastOrder = latestOrderAt
+    ? ` آخر طلب مسجل: ${formatOrderTimestamp(latestOrderAt)}.`
+    : " تاريخ آخر طلب غير متاح.";
+  return `${translated}${lastOrder} لن نعرض بيانات قديمة كترند حالي.`;
+}
+
+function validCompatibilityPercent(item: WidgetRecommendationItem | null | undefined) {
+  const value = item?.compatibility_percent;
+  if (typeof value !== "number" || !Number.isFinite(value) || value < 0 || value > 100) return null;
+  return Math.round(value);
+}
 
 function uniqueArabicLabels(values: string[]) {
   const seen = new Set<string>();
@@ -151,11 +291,25 @@ function recommendationProvenance(item: WidgetRecommendationItem) {
   };
 }
 
-function validatedModelAccuracy(item: WidgetRecommendationItem) {
-  const percent = item.model_accuracy_percent;
+function validatedModelAccuracy(
+  item: WidgetRecommendationItem,
+  group?: RecommendationPathGroup | null,
+) {
+  const descriptor = contributorObject(group?.selected_model) || contributorObject(item.selected_model);
+  const validated = group?.validated === true
+    || item.accuracy_validated === true
+    || descriptor?.validated === true;
+  if (!validated) return null;
+
+  const percent = group?.validation_percent
+    ?? item.model_accuracy_percent
+    ?? descriptor?.validation_percent;
   if (typeof percent !== "number" || !Number.isFinite(percent) || percent < 0 || percent > 100) return null;
 
-  const rawMetric = item.accuracy_metric ?? item.model_accuracy_metric;
+  const rawMetric = group?.validation_metric
+    ?? item.accuracy_metric
+    ?? item.model_accuracy_metric
+    ?? descriptor?.validation_metric;
   if (!rawMetric) return null;
   if (typeof rawMetric === "object" && rawMetric.validated !== true) return null;
 
@@ -172,6 +326,150 @@ function validatedModelAccuracy(item: WidgetRecommendationItem) {
       ? "دقة المودل الموثّقة"
       : "نتيجة المودل الموثّقة";
   return { percent: Math.round(percent * 10) / 10, metricName, label };
+}
+
+function pathModelLabel(group: RecommendationPathGroup) {
+  const descriptor = contributorObject(group.selected_model)
+    || contributorObject(group.suggestions[0]?.selected_model);
+  return descriptor?.label_ar
+    || group.suggestions[0]?.model_label_ar
+    || MODEL_LABELS_AR[group.model_key]
+    || group.model_key;
+}
+
+function sectionForPath(
+  response: WidgetRecommendationResponse,
+  context: RecommendationPathContext,
+) {
+  if (context === "full_cart") return response.sections.based_on_cart || [];
+  if (context === "last_item") return response.sections.based_on_last_item || [];
+  if (context === "popularity") return response.sections.popular || [];
+  if (context === "current_trend") return response.sections.current_trend || [];
+  return [];
+}
+
+function buildRecommendationPaths(
+  response: WidgetRecommendationResponse,
+  liveItems: Map<number, MenuItem>,
+  cartIds: Set<number>,
+  previousTopItemId: number | null,
+): RecommendationPathGroup[] {
+  const responseSelected = contributorObject(response.selected_model);
+  const selectedContext = normalizePathContext(response.default_context_key)
+    || normalizePathContext(responseSelected?.context_key)
+    || normalizePathContext(response.top_recommendations?.[0]?.recommendation_context)
+    || (cartIds.size ? "full_cart" : "popularity");
+  const responseDescriptors = [
+    response.selected_model,
+    ...(response.supporting_models || []),
+    ...(response.unavailable_models || []),
+    ...((response.top_recommendations || []).flatMap((item) => [
+      item.selected_model,
+      ...(item.supporting_models || []),
+    ])),
+  ];
+
+  return RECOMMENDATION_PATHS.map((definition) => {
+    const explicitGroup = (response.models || []).find((group) => {
+      const groupDescriptor = contributorObject(group.selected_model);
+      const groupContext = normalizePathContext(group.context_key)
+        || normalizePathContext(groupDescriptor?.context_key)
+        || (group.selected ? selectedContext : null);
+      return groupContext === definition.context_key;
+    });
+    const descriptor = contributorObject(explicitGroup?.selected_model)
+      || responseDescriptors
+        .map(contributorObject)
+        .find((candidate) => normalizePathContext(candidate?.context_key) === definition.context_key)
+      || null;
+    const rawCandidates = explicitGroup
+      ? explicitGroup.suggestions || []
+      : sectionForPath(response, definition.context_key);
+    const selectedCandidates = definition.context_key === selectedContext
+      ? [...(response.top_recommendations || []), ...rawCandidates]
+      : rawCandidates;
+    const seen = new Set<number>();
+    const rawStatus = explicitGroup?.status;
+    const staleTrend = definition.context_key === "current_trend"
+      && (
+        rawStatus === "stale"
+        || explicitGroup?.data_freshness === "stale"
+        || explicitGroup?.freshness_status === "stale"
+      );
+    const noTrendData = definition.context_key === "current_trend"
+      && explicitGroup?.freshness_status === "no_data";
+    const suggestions = (staleTrend || noTrendData ? [] : selectedCandidates).filter((item) => {
+      const liveItem = liveItems.get(item.item_id);
+      if (
+        seen.has(item.item_id)
+        || item.item_id === previousTopItemId
+        || !liveItem
+        || !liveItem.is_available
+        || item.addable === false
+        || cartIds.has(item.item_id)
+      ) return false;
+      seen.add(item.item_id);
+      return true;
+    }).slice(0, 1);
+    const status: RecommendationPathStatus = staleTrend
+      ? "stale"
+      : suggestions.length
+      ? rawStatus === "fallback" || explicitGroup?.threshold_fallback_used
+        ? "fallback"
+        : "available"
+      : "unavailable";
+    // New API groups explicitly identify the single default rail. A model can
+    // still be the selected model *inside* a supporting rail, which must not
+    // make that whole rail look like the global choice in the widget.
+    const selected = explicitGroup
+      ? explicitGroup.selected === true
+      : Boolean(
+        contributorObject(descriptor)?.role === "selected"
+        && definition.context_key === selectedContext
+        && status !== "unavailable",
+      );
+    const description = explicitGroup?.description_ar || definition.description_ar;
+    const why = explicitGroup?.why_ar
+      || suggestions[0]?.reason
+      || definition.description_ar;
+    const unavailableReason = status === "stale"
+      ? staleTrendReasonAr(
+          explicitGroup?.unavailable_reason,
+          explicitGroup?.latest_order_at || explicitGroup?.data_as_of || response.latest_order_at,
+        )
+      : status === "unavailable"
+        ? unavailableReasonAr(
+            explicitGroup?.unavailable_reason || descriptor?.unavailable_reason,
+            definition.context_key,
+            cartIds.size > 0,
+          )
+      : null;
+    const modelKey = descriptor?.model_key
+      || explicitGroup?.model_key
+      || suggestions[0]?.model_key
+      || definition.fallback_model_key;
+
+    return {
+      model_key: modelKey,
+      context_key: definition.context_key,
+      label_ar: definition.label_ar,
+      description_ar: description,
+      why_ar: why,
+      available: status === "available" || status === "fallback",
+      status,
+      unavailable_reason: unavailableReason,
+      selected_model: descriptor || explicitGroup?.selected_model || null,
+      selected,
+      validated: explicitGroup?.validated ?? descriptor?.validated ?? false,
+      validation_metric: explicitGroup?.validation_metric ?? descriptor?.validation_metric ?? null,
+      validation_percent: explicitGroup?.validation_percent ?? descriptor?.validation_percent ?? null,
+      validation_trials: explicitGroup?.validation_trials ?? descriptor?.validation_trials ?? 0,
+      validation_scope: explicitGroup?.validation_scope ?? descriptor?.validation_scope ?? null,
+      evaluation_version: explicitGroup?.evaluation_version ?? descriptor?.evaluation_version ?? null,
+      threshold_fallback_used: explicitGroup?.threshold_fallback_used ?? status === "fallback",
+      suggestions,
+    };
+  });
 }
 
 function availabilityLabel(reason: string) {
@@ -240,8 +538,8 @@ export default function App() {
   const [widgetOpen, setWidgetOpen] = useState(true);
   const [detailsOpen, setDetailsOpen] = useState(false);
   const [widgetPosition, setWidgetPosition] = useState<{ left: number; top: number } | null>(null);
-  const [modelGroups, setModelGroups] = useState<WidgetRecommendationModelGroup[]>([]);
-  const [activeModelKey, setActiveModelKey] = useState<RecommendationModelKey>("popularity");
+  const [modelGroups, setModelGroups] = useState<RecommendationPathGroup[]>([]);
+  const [activeModelKey, setActiveModelKey] = useState<RecommendationPathContext>("popularity");
   const [selectedRecommendationId, setSelectedRecommendationId] = useState<number | null>(null);
   const [recommendationError, setRecommendationError] = useState("");
   const [loadingRestaurants, setLoadingRestaurants] = useState(true);
@@ -359,38 +657,12 @@ export default function App() {
           ) return;
           const liveItems = new Map(requestMenu.items.map((item) => [item.item_id, item]));
           const cartIds = new Set(cartItemIds);
-          const responseGroups = response.models?.length
-            ? response.models
-            : [{
-                model_key: cartIds.size ? "ensemble" as const : "popularity" as const,
-                label_ar: cartIds.size ? "المزيج الذكي" : "الأكثر طلبًا",
-                description_ar: "أفضل الاقتراحات المتاحة",
-                available: Boolean(response.top_recommendations?.length),
-                threshold_fallback_used: Boolean(response.threshold_fallback_used),
-                suggestions: response.top_recommendations || [],
-              }];
-          const scopedGroups = responseGroups;
-          const validGroups = scopedGroups.map((group) => {
-            const seen = new Set<number>();
-            const suggestions = (group.suggestions || []).filter((item) => {
-              const liveItem = liveItems.get(item.item_id);
-              if (
-                seen.has(item.item_id)
-                || item.item_id === previousTopItemId
-                || !liveItem
-                || !liveItem.is_available
-                || item.addable === false
-                || cartIds.has(item.item_id)
-              ) return false;
-              if (
-                cartIds.size
-                && (item.model_key === "popularity" || item.recommendation_context === "popular")
-              ) return false;
-              seen.add(item.item_id);
-              return true;
-            });
-            return { ...group, available: suggestions.length > 0, suggestions };
-          });
+          const validGroups = buildRecommendationPaths(
+            response,
+            liveItems,
+            cartIds,
+            previousTopItemId,
+          );
           setModelGroups(validGroups);
           setRecommendationTrace({
             requestId: response.request_id,
@@ -399,12 +671,12 @@ export default function App() {
             cartItemKey: requestCartItemKey,
           });
           setActiveModelKey(() => {
-            const preferred = validGroups.find(
-              (group) => group.model_key === response.default_model_key && group.available,
-            );
-            return preferred?.model_key
-              || validGroups.find((group) => group.available)?.model_key
-              || (cartIds.size ? "fbt_confidence" : "restaurant_popularity");
+            const preferred = validGroups.find((group) => group.selected && group.available)
+              || validGroups.find(
+                (group) => group.model_key === response.default_model_key && group.available,
+              )
+              || validGroups.find((group) => group.available);
+            return preferred?.context_key || (cartIds.size ? "full_cart" : "popularity");
           });
           setSelectedRecommendationId(null);
         })
@@ -483,8 +755,8 @@ export default function App() {
 
   const activeModelGroup = useMemo(
     () =>
-      visibleModelGroups.find((group) => group.model_key === activeModelKey && group.available)
-      || visibleModelGroups.find((group) => group.model_key === "ensemble" && group.available)
+      visibleModelGroups.find((group) => group.context_key === activeModelKey)
+      || visibleModelGroups.find((group) => group.selected && group.available)
       || visibleModelGroups.find((group) => group.available)
       || null,
     [activeModelKey, visibleModelGroups],
@@ -511,9 +783,11 @@ export default function App() {
   const recommendationCanAdd = Boolean(
     recommendationMenuItem?.is_available && (!recommendationRequiresSize || recommendationSize),
   );
-  const recommendationScore = Math.round(recommendation?.compatibility_percent || 0);
+  const recommendationScore = validCompatibilityPercent(recommendation);
   const recommendationSourceDetails = recommendation ? recommendationProvenance(recommendation) : null;
-  const recommendationAccuracy = recommendation ? validatedModelAccuracy(recommendation) : null;
+  const recommendationAccuracy = recommendation
+    ? validatedModelAccuracy(recommendation, activeModelGroup)
+    : null;
 
   function emitRecommendationEvent(
     eventType: RecommendationEventType,
@@ -815,11 +1089,19 @@ export default function App() {
     setModelGroups((current) => {
       const next = current.map((group) => {
         const suggestions = group.suggestions.filter((item) => !shouldRemove(item));
-        return { ...group, suggestions, available: suggestions.length > 0 };
+        return {
+          ...group,
+          suggestions,
+          available: suggestions.length > 0,
+          status: suggestions.length ? group.status : "unavailable" as const,
+          unavailable_reason: suggestions.length
+            ? group.unavailable_reason
+            : "تمت إضافة هذا الاقتراح، ونحدّث المسار الآن.",
+        };
       });
       const nextVisibleGroup =
-        next.find((group) => group.model_key === activeModelKey && group.available)
-        || next.find((group) => group.model_key === "ensemble" && group.available)
+        next.find((group) => group.context_key === activeModelKey && group.available)
+        || next.find((group) => group.selected && group.available)
         || next.find((group) => group.available);
       const nextVisibleItemId = nextVisibleGroup?.suggestions[0]?.item_id;
       if (nextVisibleItemId != null) {
@@ -827,7 +1109,6 @@ export default function App() {
       }
       return next;
     });
-    setActiveModelKey("ensemble");
     setSelectedRecommendationId(null);
   }
 
@@ -1177,62 +1458,99 @@ export default function App() {
           >
              <div>
                <span aria-hidden="true">⋮⋮</span>
-               <strong>أفضل اقتراح موثّق</strong>
+               <strong>مسارات الاقتراح الخمسة</strong>
                <small>
                  {cartItemIds.length
-                   ? "المودل الأعلى في الاختبار لهذا المطعم"
-                   : "الأكثر طلبًا في الفترة الحالية عند توفر بياناتها"}
+                   ? "اختر المسار وشاهد المودل الفعلي وسبب الاقتراح"
+                   : "المسار الأنسب يُختار تلقائيًا ويمكنك مقارنة البقية"}
                </small>
              </div>
             <button type="button" onClick={dismissWidget} aria-label="إغلاق الويدجت">×</button>
           </header>
            <div className="widget-body">
              {recommendationError ? <div className="widget-inline-error">{recommendationError}</div> : null}
+             {visibleModelGroups.length ? (
+               <nav className="model-filters path-filters" aria-label="اختيار مسار الاقتراح">
+                 {visibleModelGroups.map((group) => (
+                   <button
+                     type="button"
+                     key={group.context_key}
+                     className={`${activeModelGroup?.context_key === group.context_key ? "active" : ""} status-${group.status}`.trim()}
+                     aria-pressed={activeModelGroup?.context_key === group.context_key}
+                     onClick={() => {
+                       setActiveModelKey(group.context_key);
+                       setSelectedRecommendationId(null);
+                     }}
+                     title={group.available ? group.description_ar : group.unavailable_reason || group.description_ar}
+                   >
+                     <span>{group.label_ar}</span>
+                     <b>{pathStatusLabel(group)}</b>
+                   </button>
+                 ))}
+               </nav>
+             ) : null}
              {loadingRecommendation && !(recommendation && recommendationMenuItem) ? (
                <div className="widget-empty"><span className="spinner" /> نجهّز اقتراحك…</div>
              ) : recommendation && recommendationMenuItem ? (
                <>
-               <article className={recommendations.length > 1 ? "recommendation-card has-stack" : "recommendation-card"}>
+               <article className="recommendation-card">
                  <span className="ai-badge">AI</span>
                  <div className="recommendation-copy">
                    <h3>{itemName(recommendationMenuItem)}</h3>
                    <div className="recommendation-meta">
-                     <span className="type-badge">
-                       المودل: {recommendationSourceDetails?.models.join(" + ") || recommendation.model_label_ar}
-                     </span>
-                     <span className={recommendation.meets_threshold ? "match-badge strong" : "match-badge"}>
-                       {recommendation.confidence_band_ar}
-                     </span>
+                     <span className="type-badge">المسار: {activeModelGroup?.label_ar}</span>
+                     {activeModelGroup ? (
+                       <span className={`path-status-badge status-${activeModelGroup.status}`}>
+                         {pathStatusLabel(activeModelGroup)}
+                       </span>
+                     ) : null}
+                     {recommendationScore != null ? (
+                       <span className={recommendation.meets_threshold ? "match-badge strong" : "match-badge"}>
+                         {recommendation.confidence_band_ar}
+                       </span>
+                     ) : <span className="descriptive-signal-badge">رصد وصفي</span>}
                      {recommendationAccuracy ? (
                        <span className="accuracy-badge" title={`مقياس التقييم: ${recommendationAccuracy.metricName}`}>
                          {recommendationAccuracy.label} {recommendationAccuracy.percent.toLocaleString("ar-SA")}%
                        </span>
                      ) : null}
                    </div>
+                   <div className="model-origin">
+                     <b>المودل الفعلي:</b> {activeModelGroup ? pathModelLabel(activeModelGroup) : recommendation.model_label_ar}
+                   </div>
                    <p className="source-summary">
                      <b>مصادر الاقتراح:</b> {recommendationSourceDetails?.sources.join(" + ") || sourceLabel(recommendation.source)}
                    </p>
-                   {recommendation.reason ? <p className="recommendation-reason">{recommendation.reason}</p> : null}
-                   {activeModelGroup?.model_key === "ensemble" && recommendation.model_agreement_count > 1 ? (
+                   <p className="recommendation-reason">
+                     <b>لماذا؟</b> {activeModelGroup?.why_ar || recommendation.reason || activeModelGroup?.description_ar}
+                   </p>
+                   {recommendation.model_agreement_count > 1 ? (
                      <span className="agreement-badge">
-                       متفق عليه من {recommendation.model_agreement_count.toLocaleString("ar-SA")} محركات
+                       مدعوم من {recommendation.model_agreement_count.toLocaleString("ar-SA")} مودلات موضّحة أعلاه
                      </span>
                    ) : null}
                    <small>{sizeName(recommendationSize)} · {formatPrice(recommendationSize?.price ?? null)}</small>
                  </div>
                  <div className="recommendation-actions">
-                   <div
-                     className={recommendation.meets_threshold ? "confidence-ring strong" : "confidence-ring"}
-                     style={{ "--score": recommendationScore } as CSSProperties}
-                     role="meter"
-                     aria-valuemin={0}
-                     aria-valuemax={100}
-                     aria-valuenow={recommendationScore}
-                     aria-label={`${recommendation.score_label_ar} ${recommendationScore}%`}
-                   >
-                     <strong>{recommendationScore.toLocaleString("ar-SA")}%</strong>
-                     <small>{recommendation.score_label_ar}</small>
-                   </div>
+                   {recommendationScore != null ? (
+                     <div
+                       className={recommendation.meets_threshold ? "confidence-ring strong" : "confidence-ring"}
+                       style={{ "--score": recommendationScore } as CSSProperties}
+                       role="meter"
+                       aria-valuemin={0}
+                       aria-valuemax={100}
+                       aria-valuenow={recommendationScore}
+                       aria-label={`${recommendation.score_label_ar} ${recommendationScore}%`}
+                     >
+                       <strong>{recommendationScore.toLocaleString("ar-SA")}%</strong>
+                       <small>{recommendation.score_label_ar}</small>
+                     </div>
+                   ) : (
+                     <div className="descriptive-signal-card" aria-label="رصد وصفي دون نسبة ملاءمة">
+                       <strong>رصد وصفي</strong>
+                       <small>بلا نسبة</small>
+                     </div>
+                   )}
                    <button
                      type="button"
                      onClick={addRecommendationToCart}
@@ -1243,73 +1561,83 @@ export default function App() {
                    </button>
                  </div>
                </article>
-              {recommendations.length ? (
+              {visibleModelGroups.length ? (
                 <button
                   className="recommendation-list-toggle"
                   type="button"
                   aria-expanded={detailsOpen}
                   onClick={() => setDetailsOpen((open) => !open)}
                 >
-                  <span>{detailsOpen ? "إخفاء قائمة الاقتراحات" : `عرض قائمة الاقتراحات (${recommendations.length})`}</span>
+                  <span>{detailsOpen ? "إخفاء تفاصيل المسارات" : "عرض المسارات الخمسة ومقارنتها"}</span>
                   <b aria-hidden="true">{detailsOpen ? "⌃" : "⌄"}</b>
                 </button>
               ) : null}
                {detailsOpen ? (
-                 <section className="recommendation-list" aria-label="أفضل الاقتراحات">
+                 <section className="recommendation-list" aria-label="مقارنة مسارات الاقتراح الخمسة">
                    <div className="recommendation-list-head">
-                     <strong>{activeModelGroup?.label_ar || "أفضل الاقتراحات"}</strong>
-                     <span>
-                       {activeModelGroup?.threshold_fallback_used
-                         ? "لا توجد نتائج فوق 70% لهذا المحرك؛ نعرض أفضل المتاح."
-                         : activeModelGroup?.description_ar || "مرتبة بعد فحص المخزون والقسم"}
-                     </span>
+                     <strong>اقتراح رئيسي واحد لكل مسار</strong>
+                     <span>المختار هو الأنسب للسياق الحالي، ويمكن فتح أي مسار متاح للمقارنة.</span>
                    </div>
-                   {recommendations.map((item, index) => {
-                    const liveItem = menu?.items.find((candidate) => candidate.item_id === item.item_id);
-                    if (!liveItem) return null;
-                    const provenance = recommendationProvenance(item);
-                    const accuracy = validatedModelAccuracy(item);
+                   {visibleModelGroups.map((group, index) => {
+                    const item = group.suggestions[0] || null;
+                    const liveItem = item
+                      ? menu?.items.find((candidate) => candidate.item_id === item.item_id) || null
+                      : null;
+                    const provenance = item ? recommendationProvenance(item) : null;
+                    const accuracy = item ? validatedModelAccuracy(item, group) : null;
+                    const compatibility = validCompatibilityPercent(item);
                     return (
                        <button
                          type="button"
-                         className={item.item_id === recommendation.item_id ? "recommendation-list-row active" : "recommendation-list-row"}
-                         key={`${activeModelGroup?.model_key}:${item.model_key}:${item.item_id}`}
+                         className={`recommendation-list-row path-row status-${group.status}${activeModelGroup?.context_key === group.context_key ? " active" : ""}`}
+                         key={group.context_key}
                          onClick={() => {
-                           emitRecommendationEvent("clicked", item);
-                           setSelectedRecommendationId(item.item_id);
+                           setActiveModelKey(group.context_key);
+                           setSelectedRecommendationId(null);
+                           if (item) emitRecommendationEvent("clicked", item);
                          }}
                        >
                         <span className="rank-number">{index + 1}</span>
                          <span className="list-copy">
-                           <strong>{itemName(liveItem)}</strong>
-                           <small className="list-model">المودل: {provenance.models.join(" + ") || item.model_label_ar}</small>
-                           <small className="list-sources">{provenance.sources.join(" + ")}</small>
+                           <strong>{group.label_ar} <em>{pathStatusLabel(group)}</em></strong>
+                           {item && liveItem ? <span className="list-item-name">{itemName(liveItem)}</span> : null}
+                           <small className="list-model">المودل: {pathModelLabel(group)}</small>
+                           {provenance ? <small className="list-sources">{provenance.sources.join(" + ")}</small> : null}
+                           <small className="list-why">
+                             {group.available ? `لماذا؟ ${group.why_ar}` : group.unavailable_reason}
+                           </small>
                            {accuracy ? (
                              <small className="list-accuracy" title={`مقياس التقييم: ${accuracy.metricName}`}>
                                {accuracy.label}: {accuracy.percent.toLocaleString("ar-SA")}%
                              </small>
                            ) : null}
-                           <i><b style={{ width: `${item.compatibility_percent}%` }} /></i>
+                           {compatibility != null ? <i><b style={{ width: `${compatibility}%` }} /></i> : null}
                          </span>
-                         <span
-                           className="list-percent"
-                           aria-label={`درجة الملاءمة ${Math.round(item.compatibility_percent)}%`}
-                           title="درجة الملاءمة للاقتراح"
-                         >
-                           {Math.round(item.compatibility_percent).toLocaleString("ar-SA")}%
-                         </span>
+                         {compatibility != null ? (
+                           <span
+                             className="list-percent"
+                             aria-label={`درجة الملاءمة ${compatibility}%`}
+                             title="درجة الملاءمة للاقتراح وليست احتمال شراء"
+                           >
+                             {compatibility.toLocaleString("ar-SA")}%
+                           </span>
+                         ) : item ? (
+                           <span className="list-descriptive-signal" aria-label="رصد وصفي دون نسبة">رصد وصفي</span>
+                         ) : <span className="path-unavailable-mark" aria-hidden="true">—</span>}
                        </button>
                     );
                   })}
                    <p className="compatibility-note">
-                     النسبة بجانب كل صنف هي درجة ملاءمته للسلة، وليست دقة المودل. دقة المودل لا تظهر إلا عند توفر مقياس تقييم موثّق من الخادم.
+                     النسبة — إن وُجدت — هي درجة ملاءمة وليست احتمال شراء. «رصد وصفي» لا يحمل نسبة، ودقة المودل لا تظهر إلا بمقياس موثّق.
                    </p>
                 </section>
               ) : null}
               </>
             ) : (
-              <div className="widget-empty error-copy">
-                <span>لا يوجد اقتراح متاح بعد فلترة المخزون وأقسام السلة.</span>
+              <div className={`widget-empty error-copy path-unavailable status-${activeModelGroup?.status || "unavailable"}`}>
+                <strong>{activeModelGroup?.label_ar || "المسار"}: {activeModelGroup ? pathStatusLabel(activeModelGroup) : "غير متاح"}</strong>
+                <span>{activeModelGroup?.unavailable_reason || "لا يوجد اقتراح متاح بعد فلترة المنيو والمخزون."}</span>
+                {activeModelGroup ? <small>المودل: {pathModelLabel(activeModelGroup)}</small> : null}
                 <button type="button" onClick={() => setRecommendationRefreshToken((token) => token + 1)}>إعادة المحاولة</button>
               </div>
             )}

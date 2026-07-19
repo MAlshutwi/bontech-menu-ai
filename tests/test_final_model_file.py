@@ -279,6 +279,18 @@ def test_api_uses_model_file(monkeypatch):
         "source": "live_database",
         "include_inactive": False,
     })
+    monkeypatch.setattr(main_module, "_current_trend_payload", lambda *args, **kwargs: {
+        "model_key": "current_trend_momentum",
+        "status": "unavailable",
+        "why_ar": "لا توجد بيانات حديثة في الاختبار.",
+        "unavailable_reason": "no_recent_orders",
+        "items": [],
+        "data_as_of": None,
+        "latest_order_at": None,
+        "freshness_status": "no_data",
+        "scope": None,
+        "is_forecast": False,
+    })
     with TestClient(main_module.app) as client:
         response = client.post("/api/v1/recommendations", json={
             "restaurant_id": RID,

@@ -78,6 +78,7 @@ class WidgetRecommendationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     restaurant_id: StrictInt = Field(..., ge=1)
+    customer_id: Optional[StrictInt] = Field(None, ge=1)
     cart_item_ids: List[StrictInt]
     last_added_item_id: Optional[StrictInt] = Field(None, ge=1)
     previous_top_item_id: Optional[StrictInt] = Field(None, ge=1)
@@ -129,7 +130,7 @@ class WidgetRecommendationItem(BaseModel):
     model_label_ar: str = "الأكثر طلبًا"
     score_label_ar: str = "قوة الطلب"
     rank: int = Field(1, ge=1)
-    compatibility_percent: float = Field(0.0, ge=0.0, le=100.0)
+    compatibility_percent: Optional[float] = Field(None, ge=0.0, le=100.0)
     probability_percent: Optional[float] = Field(None, ge=0.0, le=100.0)
     confidence_band_ar: str = "استكشافي"
     model_agreement_count: int = Field(1, ge=1)
@@ -154,9 +155,11 @@ class WidgetRecommendationSections(BaseModel):
     similar_alternatives: List[WidgetRecommendationItem] = Field(default_factory=list)
     popular: List[WidgetRecommendationItem] = Field(default_factory=list)
     time_context: List[WidgetRecommendationItem] = Field(default_factory=list)
+    current_trend: List[WidgetRecommendationItem] = Field(default_factory=list)
 
 
 class WidgetRecommendationModelGroup(BaseModel):
+    context_key: Literal["full_cart", "last_item", "popularity", "current_trend", "user"]
     model_key: str
     label_ar: str
     description_ar: str = ""
@@ -170,12 +173,21 @@ class WidgetRecommendationModelGroup(BaseModel):
     validation_trials: int = Field(0, ge=0)
     validation_scope: Optional[str] = None
     evaluation_version: Optional[str] = None
+    status: Literal["available", "unavailable", "fallback"] = "unavailable"
+    why_ar: str = ""
+    unavailable_reason: Optional[str] = None
+    selected_model: Optional[WidgetModelProvenance] = None
+    future_ready: bool = False
+    data_as_of: Optional[str] = None
+    latest_order_at: Optional[str] = None
+    freshness_status: Optional[Literal["fresh", "stale", "no_data"]] = None
 
 
 class WidgetRecommendationResponse(BaseModel):
     request_id: str
     model_version: str
     restaurant_id: int
+    customer_id: Optional[int] = None
     cart_item_ids: List[int]
     last_added_item_id: Optional[int] = None
     fallback_used: bool
@@ -184,7 +196,9 @@ class WidgetRecommendationResponse(BaseModel):
     top_recommendations: List[WidgetRecommendationItem] = Field(default_factory=list)
     models: List[WidgetRecommendationModelGroup] = Field(default_factory=list)
     default_model_key: str = "ensemble"
+    default_context_key: Literal["full_cart", "last_item", "popularity", "current_trend", "user"] = "popularity"
     available_model_keys: List[str] = Field(default_factory=list)
+    available_context_keys: List[str] = Field(default_factory=list)
     warnings: List[str] = Field(default_factory=list)
     disabled_reason: Optional[str] = None
     threshold_percent: float = 70.0

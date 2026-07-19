@@ -112,6 +112,7 @@ export type RecommendationContributingModel =
       evaluation_version?: string | null;
       time_period_key?: string | null;
       time_period_ar?: string | null;
+      unavailable_reason?: string | null;
       weight?: number;
       score?: number;
     };
@@ -136,13 +137,20 @@ export interface WidgetRecommendationItem {
   addable: boolean;
   disabled_reason: string | null;
   category_id: number | null;
-  recommendation_context: "popular" | "time_context" | "based_on_cart" | "based_on_last_item" | "similar_alternatives";
+  recommendation_context:
+    | "popular"
+    | "time_context"
+    | "based_on_cart"
+    | "based_on_last_item"
+    | "similar_alternatives"
+    | "current_trend"
+    | "user";
   type_label_ar: string;
   model_key: string;
   model_label_ar: string;
   score_label_ar: string;
   rank: number;
-  compatibility_percent: number;
+  compatibility_percent: number | null;
   probability_percent: number | null;
   confidence_band_ar: string;
   model_agreement_count: number;
@@ -154,18 +162,39 @@ export interface WidgetRecommendationItem {
   supporting_models?: RecommendationContributingModel[];
   contributing_models?: RecommendationContributingModel[];
   source_labels_ar?: string[] | string;
+  time_period_key?: string | null;
   time_period_ar?: string | null;
   /** Offline model metric; never interchangeable with compatibility_percent. */
   model_accuracy_percent?: number | null;
   accuracy_metric?: string | RecommendationAccuracyMetric | null;
   model_accuracy_metric?: string | null;
+  accuracy_validated?: boolean;
 }
+
+export type RecommendationPathContext =
+  | "full_cart"
+  | "last_item"
+  | "popularity"
+  | "current_trend"
+  | "user";
+
+export type RecommendationPathStatus = "available" | "unavailable" | "fallback" | "stale";
 
 export interface WidgetRecommendationModelGroup {
   model_key: string;
+  context_key?: RecommendationPathContext | string;
   label_ar: string;
   description_ar: string;
+  why_ar?: string;
   available: boolean;
+  status?: RecommendationPathStatus | string;
+  unavailable_reason?: string | null;
+  latest_order_at?: string | null;
+  data_freshness?: string | null;
+  data_as_of?: string | null;
+  freshness_status?: "fresh" | "stale" | "no_data" | string | null;
+  future_ready?: boolean;
+  selected_model?: RecommendationContributingModel | null;
   selected?: boolean;
   validated?: boolean;
   validation_metric?: string | null;
@@ -191,11 +220,14 @@ export interface WidgetRecommendationResponse {
     similar_alternatives: WidgetRecommendationItem[];
     popular: WidgetRecommendationItem[];
     time_context: WidgetRecommendationItem[];
+    current_trend?: WidgetRecommendationItem[];
   };
   top_recommendations: WidgetRecommendationItem[];
   models: WidgetRecommendationModelGroup[];
   default_model_key: WidgetRecommendationModelGroup["model_key"];
+  default_context_key?: RecommendationPathContext;
   available_model_keys: WidgetRecommendationModelGroup["model_key"][];
+  available_context_keys?: RecommendationPathContext[];
   warnings: string[];
   disabled_reason: string | null;
   threshold_percent: number;
@@ -205,6 +237,8 @@ export interface WidgetRecommendationResponse {
   selection_policy?: string | null;
   time_period_key?: string | null;
   time_period_ar?: string | null;
+  latest_order_at?: string | null;
+  data_freshness?: string | null;
   unavailable_models?: RecommendationContributingModel[];
 }
 

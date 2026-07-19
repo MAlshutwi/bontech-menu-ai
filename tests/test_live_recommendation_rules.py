@@ -70,7 +70,12 @@ def test_empty_cart_starts_with_live_popular_and_drops_out_of_stock():
     assert ranked["top_recommendations"][0]["recommendation_context"] == "popular"
     assert ranked["top_recommendations"][0]["type_label_ar"] == "الأكثر طلبًا"
     assert ranked["available_model_keys"] == ["restaurant_popularity"]
-    assert [model["model_key"] for model in ranked["models"]] == ["restaurant_popularity"]
+    assert [model["context_key"] for model in ranked["models"]] == [
+        "full_cart", "last_item", "popularity", "current_trend", "user",
+    ]
+    assert next(model for model in ranked["models"] if model["context_key"] == "popularity")[
+        "model_key"
+    ] == "restaurant_popularity"
     assert ranked["default_model_key"] == "restaurant_popularity"
     assert all(
         item["meets_threshold"] == (item["compatibility_percent"] >= 70)
@@ -103,15 +108,12 @@ def test_cart_priority_and_same_category_filter_prevent_similar_drinks():
     )
 
     assert [item["item_id"] for item in ranked["top_recommendations"]] == [2]
-    full_cart = next(
-        model for model in ranked["models"] if model["model_key"] == "full_cart"
-    )
+    full_cart = next(model for model in ranked["models"] if model["context_key"] == "full_cart")
     assert full_cart["suggestions"][0]["recommendation_context"] == "based_on_cart"
     assert full_cart["suggestions"][0]["type_label_ar"] == "السلة كاملة"
     assert full_cart["suggestions"][0]["model_key"] == "full_cart"
     assert "same_category_as_last_item:2" in ranked["warnings"]
-    assert all(model["model_key"] != "popularity" for model in ranked["models"])
-    assert ranked["sections"]["popular"] == []
+    assert next(model for model in ranked["models"] if model["context_key"] == "popularity")
 
 
 def test_weak_candidates_use_top_five_fallback_without_fake_70_percent():
@@ -183,12 +185,13 @@ def test_model_catalog_is_independent_and_confidence_is_stable():
     )
 
     ranked = _apply_live_recommendation_rules(result, live_menu, [99])
-    groups = {group["model_key"]: group for group in ranked["models"]}
+    groups = {group["context_key"]: group for group in ranked["models"]}
 
-    assert list(groups) == ["full_cart"]
+    assert list(groups) == ["full_cart", "last_item", "popularity", "current_trend", "user"]
     assert groups["full_cart"]["suggestions"][0]["item_id"] == 1
     assert groups["full_cart"]["suggestions"][0]["model_agreement_count"] == 2
-    assert ranked["sections"]["popular"] == []
+    assert groups["user"]["status"] == "unavailable"
+    assert groups["user"]["future_ready"] is True
     assert [item["compatibility_percent"] for item in ranked["sections"]["based_on_cart"]] == sorted(
         [item["compatibility_percent"] for item in ranked["sections"]["based_on_cart"]],
         reverse=True,
@@ -222,11 +225,10 @@ def test_model_source_identity_is_pure_and_weak_model_does_not_pollute_ensemble(
     )
 
     ranked = _apply_live_recommendation_rules(result, live_menu, [99])
-    groups = {group["model_key"]: group for group in ranked["models"]}
+    groups = {group["context_key"]: group for group in ranked["models"]}
 
     assert [item["item_id"] for item in groups["full_cart"]["suggestions"]] == [1]
-    assert "popularity" not in groups
-    assert ranked["sections"]["popular"] == []
+    assert groups["popularity"]["suggestions"]
     assert groups["full_cart"]["threshold_fallback_used"] is False
     assert all(item["meets_threshold"] for item in groups["full_cart"]["suggestions"])
     assert ranked["threshold_fallback_used"] is False
@@ -367,10 +369,13 @@ def test_selected_model_keeps_exact_validated_accuracy_and_combined_provenance()
         "الأكثر طلبًا",
         "الأكثر طلبًا في فترة العصر",
     ]
-    assert ranked["sections"]["popular"] == []
-    assert ranked["sections"]["time_context"] == []
+    assert ranked["sections"]["popular"]
+    assert ranked["sections"]["time_context"]
     assert ranked["default_model_key"] == "fbt_confidence"
-    assert [model["model_key"] for model in ranked["models"]] == ["fbt_confidence"]
+    assert [model["context_key"] for model in ranked["models"]] == [
+        "full_cart", "last_item", "popularity", "current_trend", "user",
+    ]
+    assert ranked["models"][0]["model_key"] == "fbt_confidence"
 
 
 def test_unvalidated_fallback_never_exposes_fake_accuracy():
@@ -392,3 +397,78 @@ def test_unvalidated_fallback_never_exposes_fake_accuracy():
     assert item["accuracy_validated"] is False
     assert item["model_accuracy_percent"] is None
     assert item["accuracy_metric"] is None
+
+
+def test_five_fixed_routes_include_honest_current_trend_and_future_user_slot():
+    live_menu = {
+        "items": [_item(99, 1), _item(1, 2), _item(2, 3), _item(3, 4)],
+    }
+    trend = _rec(3, 2.5, "current_trend_nowcast", "current_trend")
+    trend["evidence"] = {
+        "observation_type": "current_nowcast_not_forecast",
+        "recent_order_count": 8,
+        "baseline_order_count": 4,
+        "score_is_probability": False,
+    }
+    result = _result(
+        based_on_cart=[_rec(1, 0.8)],
+        based_on_last_item=[_rec(2, 0.7)],
+        popular=[_rec(2, 0.9, "restaurant_popularity", "popular")],
+        current_trend=[trend],
+    )
+    result["current_trend"] = {
+        "status": "available",
+        "why_ar": "رصد وصفي حديث.",
+        "unavailable_reason": None,
+        "data_as_of": "2026-07-19T12:00:00+00:00",
+        "latest_order_at": "2026-07-19T11:00:00+00:00",
+        "freshness_status": "fresh",
+    }
+
+    ranked = _apply_live_recommendation_rules(
+        result,
+        live_menu,
+        [99],
+        last_added_item_id=99,
+        customer_id=123,
+    )
+    groups = ranked["models"]
+
+    assert [group["context_key"] for group in groups] == [
+        "full_cart", "last_item", "popularity", "current_trend", "user",
+    ]
+    trend_group = groups[3]
+    assert trend_group["status"] == "available"
+    assert trend_group["model_key"] == "current_trend_momentum"
+    assert trend_group["validated"] is False
+    assert trend_group["validation_percent"] is None
+    assert trend_group["suggestions"][0]["compatibility_percent"] is None
+    assert trend_group["suggestions"][0]["probability_percent"] is None
+    assert trend_group["freshness_status"] == "fresh"
+    user_group = groups[4]
+    assert user_group["status"] == "unavailable"
+    assert user_group["future_ready"] is True
+    assert user_group["unavailable_reason"] == "insufficient_validated_customer_order_linkage"
+    assert ranked["default_context_key"] == "full_cart"
+    assert [item["item_id"] for item in ranked["top_recommendations"]] == [1]
+
+
+def test_stale_trend_slot_preserves_latest_order_and_has_no_suggestions():
+    result = _result(current_trend=[])
+    result["current_trend"] = {
+        "status": "unavailable",
+        "why_ar": "آخر طلب قديم.",
+        "unavailable_reason": "stale_order_history",
+        "data_as_of": "2026-07-19T12:00:00+00:00",
+        "latest_order_at": "2025-10-28T10:00:00+00:00",
+        "freshness_status": "stale",
+    }
+
+    ranked = _apply_live_recommendation_rules(result, {"items": []}, [])
+    trend_group = ranked["models"][3]
+
+    assert trend_group["context_key"] == "current_trend"
+    assert trend_group["status"] == "unavailable"
+    assert trend_group["unavailable_reason"] == "stale_order_history"
+    assert trend_group["latest_order_at"] == "2025-10-28T10:00:00+00:00"
+    assert trend_group["suggestions"] == []
