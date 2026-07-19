@@ -165,8 +165,9 @@ function validatedModelAccuracy(item: WidgetRecommendationItem) {
   if (!metricName) return null;
 
   const normalizedMetric = metricName.toLocaleLowerCase("en");
-  const label = normalizedMetric.includes("recall@5")
-    ? "Recall@5 الموثّق"
+  const recallMetric = normalizedMetric.match(/recall@(\d+)/);
+  const label = recallMetric
+    ? `Recall@${recallMetric[1]} الموثّق`
     : normalizedMetric.includes("accuracy")
       ? "دقة المودل الموثّقة"
       : "نتيجة المودل الموثّقة";
