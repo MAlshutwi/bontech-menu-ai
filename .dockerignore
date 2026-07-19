@@ -1,4 +1,6 @@
 .git
+.github
+.codex-deploy
 .agents
 .codex
 .pytest_cache
@@ -12,8 +14,13 @@ ToCoun/.env
 ToCoun/_*.json
 ToCoun/_*.png
 ToCoun/menus/
+ToCoun/node_modules/
 ToCoun/LovableMenuAI/node_modules/
 ToCoun/LovableMenuAI/dist/
+tests/
+*.xlsx
+*.docx
+*.zip
 reports/events/*.jsonl
 reports/events/*.log
 reports/

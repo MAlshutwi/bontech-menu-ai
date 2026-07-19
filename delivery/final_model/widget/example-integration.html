@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>Smart Suggestions Widget Integration</title>
+  <link rel="stylesheet" href="/demo/widget/smart-suggestions-widget.css"/>
+  <style>
+    :root{--ink:#071713;--muted:#738178;--line:#eadccb;--accent:#ff856f;--navy:#1d2637;--surface:#fffdf9;--canvas:#fff3e2}
+    *{box-sizing:border-box}
+    body{margin:0;background:var(--canvas);color:var(--ink);font-family:Inter,Segoe UI,Tahoma,Arial,sans-serif}
+    header{padding:18px 22px;background:var(--surface);border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center;gap:16px}
+    h1{font-size:22px;margin:0}.sub{color:var(--muted);font-size:12px;margin-top:4px}
+    main{max-width:1040px;margin:0 auto;padding:18px;display:grid;grid-template-columns:360px minmax(0,1fr);gap:16px}
+    section{background:var(--surface);border:1px solid var(--line);border-radius:16px;padding:16px;box-shadow:0 4px 12px rgba(29,38,55,.06)}
+    label{display:block;font-size:12px;color:var(--muted);font-weight:800;margin:10px 0 4px}
+    input{width:100%;border:1px solid var(--line);border-radius:12px;padding:10px;background:#fff;color:var(--ink);font:inherit}
+    button{border:0;border-radius:999px;background:var(--accent);color:#fff;padding:10px 14px;font:inherit;font-weight:900;cursor:pointer}
+    button.secondary{background:var(--navy)}button.ghost{background:#fff;color:var(--ink);border:1px solid var(--line)}
+    .actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}.cart{display:flex;flex-direction:column;gap:8px}
+    .row{border:1px solid var(--line);border-radius:12px;background:#fffaf4;padding:10px;display:flex;justify-content:space-between;gap:10px}
+    .row span{color:var(--muted);font-size:12px}pre{direction:ltr;text-align:left;white-space:pre-wrap;overflow:auto;max-height:420px;background:#111820;color:#e9edf2;border-radius:12px;padding:12px;font-size:12px}
+    details{margin-top:12px}summary{cursor:pointer;font-weight:900}
+    @media (max-width:800px){main{grid-template-columns:1fr}header{align-items:flex-start;flex-direction:column}}
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Smart Suggestions Widget Integration</h1>
+      <div class="sub">POS -> Widget -> Recommendation API -> Recommender Service -> Model file</div>
+    </div>
+    <button class="secondary" id="openWidgetBtn">Smart Suggestions</button>
+  </header>
+
+  <main>
+    <section>
+      <h2>POS Inputs</h2>
+      <label for="apiBaseUrl">apiBaseUrl</label>
+      <input id="apiBaseUrl" value="http://127.0.0.1:8000"/>
+
+      <label for="restaurantId">restaurant_id</label>
+      <input id="restaurantId" value="277"/>
+
+      <label for="cartItemIds">cart_item_ids</label>
+      <input id="cartItemIds" value="4648"/>
+
+      <label for="lastAddedItemId">last_added_item_id</label>
+      <input id="lastAddedItemId" value="4648"/>
+
+      <div class="actions">
+        <button id="initWidgetBtn">Init Widget</button>
+        <button id="runBtn" class="secondary">Run Recommendations</button>
+        <button id="simulateAddBtn" class="ghost">Simulate Add Item</button>
+        <button id="clearBtn" class="ghost">Clear Cart</button>
+      </div>
+    </section>
+
+    <section>
+      <h2>Example POS Cart</h2>
+      <div id="cartRows" class="cart"></div>
+      <details open>
+        <summary>API response debug</summary>
+        <pre id="debug">{}</pre>
+      </details>
+    </section>
+  </main>
+
+  <script src="/demo/widget/smart-suggestions-widget.js"></script>
+  <script>
+    let widget = null;
+    let cart = [4648];
+    const sampleAdds = [6706, 6829, 6878, 6877, 6820];
+    let sampleIndex = 0;
+    const $ = (id) => document.getElementById(id);
+
+    function parseIds(value){
+      return String(value || "").split(",").map((x) => Number(x.trim())).filter((x) => Number.isInteger(x) && x > 0);
+    }
+
+    function syncInputs(lastAdded){
+      $("cartItemIds").value = cart.join(",");
+      $("lastAddedItemId").value = lastAdded || cart[cart.length - 1] || "";
+      renderCart();
+    }
+
+    function renderCart(){
+      const counts = new Map();
+      for(const id of cart) counts.set(id, (counts.get(id) || 0) + 1);
+      $("cartRows").innerHTML = [...counts.entries()].map(([id, qty]) =>
+        `<div class="row"><strong>item_id ${id}</strong><span>qty ${qty}</span></div>`
+      ).join("") || `<div class="row"><strong>Empty cart</strong><span>fallback test</span></div>`;
+    }
+
+    function initWidget(){
+      if(widget) return widget;
+      widget = new SmartSuggestionsWidget({
+        apiBaseUrl: $("apiBaseUrl").value.trim(),
+        restaurantId: Number($("restaurantId").value),
+        locale: "ar",
+        onAddRecommendation: function(item){
+          cart.push(Number(item.item_id));
+          syncInputs(Number(item.item_id));
+        }
+      });
+      widget.init();
+      return widget;
+    }
+
+    async function runRecommendations(){
+      const instance = initWidget();
+      cart = parseIds($("cartItemIds").value);
+      const lastAdded = Number($("lastAddedItemId").value) || cart[cart.length - 1] || null;
+      instance.options.apiBaseUrl = $("apiBaseUrl").value.trim();
+      instance.options.restaurantId = Number($("restaurantId").value);
+      instance.onCartChanged({cartItemIds: cart, lastAddedItemId: lastAdded});
+      const res = await fetch(instance.apiUrl(instance.options.endpoint), {
+        method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({
+          restaurant_id:Number($("restaurantId").value),
+          cart_item_ids:[...new Set(cart)],
+          last_added_item_id:lastAdded || undefined,
+          limit:5,
+          context:{source:"example_integration", channel:"pos", locale:"ar"}
+        })
+      });
+      $("debug").textContent = JSON.stringify(await res.json(), null, 2);
+    }
+
+    $("initWidgetBtn").addEventListener("click", initWidget);
+    $("runBtn").addEventListener("click", runRecommendations);
+    $("openWidgetBtn").addEventListener("click", () => initWidget().open());
+    $("simulateAddBtn").addEventListener("click", () => {
+      const next = sampleAdds[sampleIndex % sampleAdds.length];
+      sampleIndex += 1;
+      cart.push(next);
+      syncInputs(next);
+      initWidget().onCartChanged({cartItemIds: cart, lastAddedItemId: next});
+    });
+    $("clearBtn").addEventListener("click", () => {
+      cart = [];
+      syncInputs(null);
+      $("debug").textContent = "{}";
+      if(widget) widget.onCartChanged({cartItemIds: [], lastAddedItemId: null});
+    });
+    syncInputs(4648);
+  </script>
+</body>
+</html>

@@ -1,5 +1,6 @@
 import type {
   MenuItemAvailabilityResponse,
+  RecommendationEventPayload,
   Restaurant,
   RestaurantMenuResponse,
   WidgetRecommendationResponse,
@@ -12,10 +13,30 @@ const DEFAULT_API_URL = isApiHost ? window.location.origin : DEPLOYED_API_URL;
 const configuredBaseUrl = import.meta.env.VITE_MENU_API_URL?.trim() || DEFAULT_API_URL;
 const baseUrl = configuredBaseUrl.replace(/\/$/, "");
 
+function errorMessage(body: unknown, fallback: string): string {
+  if (!body || typeof body !== "object") return fallback;
+  const detail = (body as { detail?: unknown }).detail;
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((entry) => {
+        if (typeof entry === "string") return entry;
+        if (!entry || typeof entry !== "object") return "";
+        const issue = entry as { msg?: unknown; loc?: unknown[] };
+        const message = typeof issue.msg === "string" ? issue.msg : "";
+        const location = Array.isArray(issue.loc) ? issue.loc.slice(1).join(".") : "";
+        return location && message ? `${location}: ${message}` : message;
+      })
+      .filter(Boolean);
+    if (messages.length) return messages.join("، ");
+  }
+  return fallback;
+}
+
 async function getJson<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${baseUrl}${path}`, init);
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.detail || `تعذر تحميل البيانات (${response.status})`);
+  if (!response.ok) throw new Error(errorMessage(body, `تعذر تحميل البيانات (${response.status})`));
   return body as T;
 }
 
@@ -27,7 +48,7 @@ async function postJson<T>(path: string, payload: unknown, signal?: AbortSignal)
     signal,
   });
   const body = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(body.detail || `تعذر تحميل الاقتراح (${response.status})`);
+  if (!response.ok) throw new Error(errorMessage(body, `تعذر تحميل الاقتراح (${response.status})`));
   return body as T;
 }
 
@@ -79,4 +100,14 @@ export function getRecommendationModels(
     },
     signal,
   );
+}
+
+/** Analytics must never block or break the ordering flow. */
+export function sendRecommendationEvent(payload: RecommendationEventPayload): void {
+  void fetch(`${baseUrl}/api/recommendation-events`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    keepalive: true,
+  }).catch(() => undefined);
 }

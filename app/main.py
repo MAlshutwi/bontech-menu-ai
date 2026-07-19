@@ -11,8 +11,10 @@ Security: internal service only; bind to loopback or a private network.
 """
 from __future__ import annotations
 import json
+import hmac
 import logging
 import math
+import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -28,9 +30,9 @@ from starlette.middleware.gzip import GZipMiddleware
 from .config import MODEL_VERSION, SERVING
 from .model_loader import final_model_path, load_model
 from .recommender import get_engine
-from .db import (fetch_restaurants, fetch_restaurants_with_menu_counts,
-                 fetch_restaurant_menu, fetch_restaurant_menu_with_sizes,
-                 fetch_restaurant_item_availability)
+from .db import (fetch_restaurants_with_menu_counts,
+                 fetch_restaurant_menu_with_sizes,
+                 fetch_restaurant_item_availability, check_database_connection)
 from .runtime import (kill_switch_status, check_api_key, api_key_required, tenant_allowed,
                       rate_limit_ok, new_request_id, METRICS)
 from .demo_page import DEMO_HTML
@@ -54,11 +56,18 @@ LOVABLE_MENU_DIST = ROOT_DIR / "ToCoun" / "LovableMenuAI" / "dist"
 LOVABLE_MENU_INDEX = LOVABLE_MENU_DIST / "index.html"
 RESTAURANTS_CACHE_TTL_SECONDS = 5 * 60
 MENU_CACHE_TTL_SECONDS = 15
+MENU_CACHE_MAX_ENTRIES = 256
+DB_READINESS_CACHE_TTL_SECONDS = 10
+MAX_REQUEST_BODY_BYTES = 64 * 1024
+EVENTS_MAX_BYTES_PER_DAY = 25 * 1024 * 1024
 _LIVE_CACHE_LOCK = RLock()
 _RESTAURANTS_LOAD_LOCK = Lock()
 _RESTAURANTS_CACHE = None
 _MENU_CACHE = {}
-_MENU_LOAD_LOCKS = {}
+_MENU_LOAD_LOCKS = tuple(Lock() for _ in range(64))
+_DB_READINESS_LOCK = Lock()
+_DB_READINESS_CACHE = None
+_EVENTS_WRITE_LOCK = Lock()
 
 
 @asynccontextmanager
@@ -71,7 +80,9 @@ async def lifespan(app: FastAPI):
             if not os.environ.get("API_KEY"):
                 log.warning("require_api_key=true but API_KEY env not set — all requests will be rejected")
         else:
-            log.warning("API auth disabled (serving.require_api_key=false) — internal network only")
+            log.warning(
+                "API key auth disabled; public browser endpoints remain protected by IP rate limits"
+            )
         log.info("model file loaded | path=%s | model_version=%s", final_model_path(), model.model_version)
     except Exception:
         log.exception("failed to load model file at startup")
@@ -104,34 +115,81 @@ async def observability(request: Request, call_next):
     rid = request.headers.get("X-Request-Id") or new_request_id()
     request.state.request_id = rid
     t0 = time.perf_counter()
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            body_too_large = int(content_length) > MAX_REQUEST_BODY_BYTES
+        except ValueError:
+            body_too_large = True
+        if body_too_large:
+            latency = 1000 * (time.perf_counter() - t0)
+            METRICS.record(f"{request.method} request_body_rejected", latency, 413)
+            resp = JSONResponse(
+                status_code=413,
+                content={"detail": "request body too large", "request_id": rid},
+            )
+            resp.headers["X-Request-Id"] = rid
+            return resp
     try:
         resp = await call_next(request)
     except Exception:
         latency = 1000 * (time.perf_counter() - t0)
-        METRICS.record(request.url.path, latency, 500)
+        METRICS.record(_metric_endpoint(request), latency, 500)
         log.exception("request_id=%s %s %s -> 500 (%.1fms)", rid, request.method, request.url.path, latency)
         return JSONResponse(status_code=500, content={"detail": "internal error", "request_id": rid})
     latency = 1000 * (time.perf_counter() - t0)
-    METRICS.record(request.url.path, latency, resp.status_code)
+    METRICS.record(_metric_endpoint(request), latency, resp.status_code)
     resp.headers["X-Request-Id"] = rid
     # Structured request log without PII or credentials.
     log.info("request_id=%s %s %s -> %s (%.1fms)", rid, request.method, request.url.path, resp.status_code, latency)
     return resp
 
 
+def _metric_endpoint(request: Request) -> str:
+    """Use a route template, never attacker-controlled path values, as a key."""
+    route = request.scope.get("route")
+    template = getattr(route, "path", None) or "unmatched"
+    return f"{request.method} {template}"
+
+
+def _client_rate_key(request: Request) -> str:
+    """Stable identity that cannot be rotated with a made-up X-API-Key."""
+    host = request.client.host if request.client else "unknown"
+    return f"ip:{host}"
+
+
+def _is_admin_key(x_api_key: str | None) -> bool:
+    expected = os.environ.get("API_KEY", "")
+    return bool(expected and x_api_key and hmac.compare_digest(x_api_key, expected))
+
+
 def _guard(request: Request, x_api_key, restaurant_id=None):
     """Shared guard for kill switch, API key, rate limit, and tenant scope."""
     disabled, reason = kill_switch_status()
     if disabled:
-        METRICS.disabled_hits += 1
+        METRICS.record_disabled()
         raise HTTPException(status_code=503, detail=f"AI recommendations disabled: {reason}")
     if not check_api_key(x_api_key):
         raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
-    key = x_api_key or (request.client.host if request.client else "anon")
+    key = _client_rate_key(request)
     if not rate_limit_ok(key):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
     if restaurant_id is not None and not tenant_allowed(x_api_key, restaurant_id):
         raise HTTPException(status_code=403, detail="restaurant not allowed for this API key")
+
+
+def _guard_public_read(
+    request: Request, *, fresh: bool = False, rate_scope: str | None = None
+):
+    """Rate-limit browser-safe active menu reads without requiring a secret."""
+    if fresh and _is_admin_key(request.headers.get("X-API-Key")):
+        scope = "default"
+    elif rate_scope:
+        scope = rate_scope
+    else:
+        scope = "fresh_read" if fresh else "public_read"
+    if not rate_limit_ok(_client_rate_key(request), scope=scope):
+        raise HTTPException(status_code=429, detail="rate limit exceeded")
 
 
 def _unique_positive_ints(values):
@@ -220,25 +278,34 @@ def _availability_state(mode, current_value):
     normalized = str(mode or "").strip().lower()
     remaining = _optional_number(current_value)
     configured = bool(normalized)
-    is_available = True
+    # No availability rule means the catalog's active/published state remains
+    # authoritative. Once a stock rule exists, however, unknown values fail closed.
+    is_available = not configured
     reason = "availability_unconfigured"
 
     if normalized == "outofstock":
         is_available = False
         reason = "out_of_stock"
     elif normalized == "staticquantity":
-        if remaining is not None and remaining <= 0:
+        if remaining is None:
+            reason = "quantity_unknown"
+        elif remaining <= 0:
             is_available = False
             reason = "quantity_depleted"
         else:
-            reason = "quantity_available" if remaining is not None else "quantity_unknown"
+            is_available = True
+            reason = "quantity_available"
     elif normalized == "dependonstock":
-        if remaining is not None and remaining <= 0:
+        if remaining is None:
+            reason = "stock_managed_unknown"
+        elif remaining <= 0:
             is_available = False
             reason = "stock_depleted"
         else:
-            reason = "stock_available" if remaining is not None else "stock_managed_unknown"
+            is_available = True
+            reason = "stock_available"
     elif normalized == "alwaysavailable":
+        is_available = True
         reason = "always_available"
     elif configured:
         reason = "availability_mode_unknown"
@@ -254,10 +321,11 @@ def _availability_state(mode, current_value):
 
 def _reset_live_data_caches():
     """Clear request-time caches (used by tests and operational refreshes)."""
-    global _RESTAURANTS_CACHE
+    global _RESTAURANTS_CACHE, _DB_READINESS_CACHE
     with _LIVE_CACHE_LOCK:
         _RESTAURANTS_CACHE = None
         _MENU_CACHE.clear()
+        _DB_READINESS_CACHE = None
 
 
 def _cached_restaurants_payload(fresh: bool = False):
@@ -374,16 +442,13 @@ def _fetch_live_menu_payload(restaurant_id: int, include_inactive: bool = False)
 
 def _live_menu_payload(restaurant_id: int, include_inactive: bool = False, fresh: bool = False):
     key = (int(restaurant_id), bool(include_inactive))
+    load_lock = _MENU_LOAD_LOCKS[hash(key) % len(_MENU_LOAD_LOCKS)]
     now = time.monotonic()
     if not fresh:
         with _LIVE_CACHE_LOCK:
             cached = _MENU_CACHE.get(key)
             if cached is not None and cached[0] > now:
                 return cached[1]
-            load_lock = _MENU_LOAD_LOCKS.setdefault(key, Lock())
-    else:
-        with _LIVE_CACHE_LOCK:
-            load_lock = _MENU_LOAD_LOCKS.setdefault(key, Lock())
 
     with load_lock:
         now = time.monotonic()
@@ -394,14 +459,55 @@ def _live_menu_payload(restaurant_id: int, include_inactive: bool = False, fresh
                     return cached[1]
         payload = _fetch_live_menu_payload(int(restaurant_id), bool(include_inactive))
         with _LIVE_CACHE_LOCK:
+            expired_keys = [cache_key for cache_key, value in _MENU_CACHE.items() if value[0] <= time.monotonic()]
+            for expired_key in expired_keys:
+                _MENU_CACHE.pop(expired_key, None)
+            if key not in _MENU_CACHE and len(_MENU_CACHE) >= MENU_CACHE_MAX_ENTRIES:
+                oldest_key = min(_MENU_CACHE, key=lambda cache_key: _MENU_CACHE[cache_key][0])
+                _MENU_CACHE.pop(oldest_key, None)
             _MENU_CACHE[key] = (time.monotonic() + MENU_CACHE_TTL_SECONDS, payload)
         return payload
+
+
+def _invalidate_menu_cache(restaurant_id: int):
+    rid = int(restaurant_id)
+    with _LIVE_CACHE_LOCK:
+        for key in [key for key in _MENU_CACHE if key[0] == rid]:
+            _MENU_CACHE.pop(key, None)
+
+
+def _database_readiness(fresh: bool = False):
+    global _DB_READINESS_CACHE
+    now = time.monotonic()
+    with _LIVE_CACHE_LOCK:
+        cached = _DB_READINESS_CACHE
+        if not fresh and cached is not None and cached[0] > now:
+            return cached[1], cached[2]
+    with _DB_READINESS_LOCK:
+        now = time.monotonic()
+        with _LIVE_CACHE_LOCK:
+            cached = _DB_READINESS_CACHE
+            if not fresh and cached is not None and cached[0] > now:
+                return cached[1], cached[2]
+        checked_at = datetime.now(timezone.utc).isoformat()
+        try:
+            ready = bool(check_database_connection())
+        except Exception:
+            ready = False
+            log.warning("database readiness check failed", exc_info=True)
+        with _LIVE_CACHE_LOCK:
+            _DB_READINESS_CACHE = (
+                time.monotonic() + DB_READINESS_CACHE_TTL_SECONDS,
+                ready,
+                checked_at,
+            )
+        return ready, checked_at
 
 
 def _live_item_availability_payload(restaurant_id: int, item_id: int):
     frame = fetch_restaurant_item_availability(restaurant_id, item_id)
     if frame.empty:
-        raise HTTPException(status_code=404, detail="restaurant not found")
+        raise HTTPException(status_code=404, detail="active menu item not found")
     raw = json.loads(frame.to_json(orient="records", force_ascii=False))
     if not raw or raw[0].get("item_id") is None:
         raise HTTPException(status_code=404, detail="active menu item not found")
@@ -440,7 +546,7 @@ def _live_item_availability_payload(restaurant_id: int, item_id: int):
         is_available = item_availability["is_available"]
         availability_reason = item_availability["availability_reason"]
 
-    return {
+    payload = {
         "restaurant_id": int(restaurant_id),
         "item_id": int(item_id),
         "category_id": raw[0].get("category_id"),
@@ -451,6 +557,10 @@ def _live_item_availability_payload(restaurant_id: int, item_id: int):
         "checked_at": datetime.now(timezone.utc).isoformat(),
         "source": "live_database",
     }
+    # A stock check is authoritative and may reveal a changed state. Drop any
+    # short-lived menu snapshot so subsequent recommendations cannot reuse it.
+    _invalidate_menu_cache(restaurant_id)
+    return payload
 
 
 _CONTEXT_META = {
@@ -507,10 +617,10 @@ _ENSEMBLE_CONTEXT_WEIGHTS = {
 }
 
 _MODEL_ALLOWED_SOURCES = {
-    "based_on_cart": {"restaurant_fbt", "pooled_fbt"},
+    "based_on_cart": {"restaurant_fbt", "pooled_fbt", "live_menu_fallback"},
     "based_on_last_item": {"restaurant_fbt", "pooled_fbt"},
     "similar_alternatives": {"item2vec"},
-    "popular": {"restaurant_popularity", "global_common"},
+    "popular": {"restaurant_popularity", "global_common", "live_menu_fallback"},
 }
 
 
@@ -840,50 +950,74 @@ def _apply_live_recommendation_rules(
 
 def _build_widget_recommendations(req: WidgetRecommendationRequest, request: Request):
     t0 = time.perf_counter()
+    # Load the active menu first so the portable model can serve restaurants that
+    # were not present (or had too little history) when the artifact was trained.
+    # The same short-lived snapshot is reused by the final stock/category filter.
+    live_menu = _live_menu_payload(
+        req.restaurant_id,
+        include_inactive=False,
+        fresh=False,
+    )
     result = load_model().recommend(
         restaurant_id=req.restaurant_id,
         cart_item_ids=list(req.cart_item_ids),
         last_added_item_id=req.last_added_item_id,
         limit=req.limit,
         previous_top_item_id=req.previous_top_item_id,
+        live_candidates=live_menu["items"],
     )
-    if result.get("disabled_reason"):
-        result["threshold_percent"] = 70.0
-        result["threshold_fallback_used"] = False
-    else:
-        # Reuse the short-lived menu snapshot for fast cart interactions. A fresh,
-        # item-level availability check remains mandatory when a suggestion is
-        # accepted, so stale stock can never be added from the widget.
-        live_menu = _live_menu_payload(
-            req.restaurant_id,
-            include_inactive=False,
-            fresh=False,
-        )
-        result = _apply_live_recommendation_rules(
-            result,
-            live_menu,
-            req.cart_item_ids,
-            last_added_item_id=req.last_added_item_id,
-            previous_top_item_id=req.previous_top_item_id,
-            display_limit=req.limit,
-        )
+    result = _apply_live_recommendation_rules(
+        result,
+        live_menu,
+        req.cart_item_ids,
+        last_added_item_id=req.last_added_item_id,
+        previous_top_item_id=req.previous_top_item_id,
+        display_limit=req.limit,
+    )
     latency_ms = round(1000 * (time.perf_counter() - t0), 2)
     result["request_id"] = request.state.request_id
     result["latency_ms"] = latency_ms
     return result
 
 
-@app.get("/health", response_model=HealthResponse)
-def health():
+def _filter_legacy_result_against_live_menu(result: dict, restaurant_id: int) -> dict:
+    """Keep compatibility endpoints from returning deleted or depleted items."""
+    live_menu = _live_menu_payload(int(restaurant_id), include_inactive=False, fresh=False)
+    available_ids = {
+        int(item["item_id"])
+        for item in live_menu["items"]
+        if item.get("is_available", False)
+    }
+    filtered = dict(result)
+    filtered["recommendations"] = [
+        item for item in result.get("recommendations", [])
+        if int(item.get("item_id")) in available_ids
+    ]
+    filtered_groups = []
+    for group in result.get("recommendation_groups", []):
+        filtered_groups.append({
+            **group,
+            "items": [
+                item for item in group.get("items", [])
+                if int(item.get("item_id")) in available_ids
+            ],
+        })
+    filtered["recommendation_groups"] = filtered_groups
+    filtered["fallback_used"] = bool(filtered.get("fallback_used") or not filtered["recommendations"])
+    return filtered
+
+
+def _health_payload():
     model = load_model()
     eng = model.engine
     disabled, reason = kill_switch_status()
+    database_ready, readiness_checked_at = _database_readiness()
     recall = (model.metadata.get("eval_recall@5") or {}).get("hybrid_production")
     accuracy_percent = None
     if recall is not None:
         accuracy_percent = round(max(0.0, min(float(recall), 1.0)) * 100, 2)
     return HealthResponse(
-        status="ok",
+        status="ok" if database_ready else "not_ready",
         model_version=model.model_version,
         last_trained_at=_META.get("generated_at"),
         model_accuracy_metric="eval_recall@5.hybrid_production",
@@ -893,7 +1027,23 @@ def health():
         kill_switch_active=disabled,
         kill_switch_reason=reason or None,
         api_key_required=api_key_required(),
+        database_ready=database_ready,
+        readiness_checked_at=readiness_checked_at,
     )
+
+
+@app.get("/health", response_model=HealthResponse, responses={503: {"model": HealthResponse}})
+def health():
+    payload = _health_payload()
+    if not payload.database_ready:
+        return JSONResponse(status_code=503, content=payload.model_dump(mode="json"))
+    return payload
+
+
+@app.get("/ready", response_model=HealthResponse, responses={503: {"model": HealthResponse}})
+def readiness():
+    """Readiness alias suitable for platforms that separate live/ready probes."""
+    return health()
 
 
 @app.get("/metrics")
@@ -919,9 +1069,10 @@ def recommendations(req: RecommendationRequest, request: Request, x_api_key: str
         include_types=req.include_types,
         context=req.context.model_dump() if req.context else None,
     )
+    res = _filter_legacy_result_against_live_menu(res, req.restaurant_id)
     res["request_id"] = request.state.request_id
     if not res.get("recommendations"):
-        METRICS.rejected += 1
+        METRICS.record_rejected()
     return res
 
 
@@ -940,7 +1091,16 @@ def popular(restaurant_id: int, request: Request, top_k: int = Query(10, ge=1, l
             x_api_key: str = Header(default=None)):
     _guard(request, x_api_key, restaurant_id)
     eng = get_engine()
-    recs = eng.popular(restaurant_id, top_k=top_k)
+    live_menu = _live_menu_payload(int(restaurant_id), include_inactive=False, fresh=False)
+    available_ids = {
+        int(item["item_id"])
+        for item in live_menu["items"]
+        if item.get("is_available", False)
+    }
+    recs = [
+        item for item in eng.popular(restaurant_id, top_k=top_k * 4)
+        if int(item.get("item_id")) in available_ids
+    ][:top_k]
     return RecommendationResponse(
         restaurant_id=restaurant_id, customer_id=None, recommendations=recs,
         fallback_used=True, model_version=MODEL_VERSION, request_id=request.state.request_id)
@@ -953,6 +1113,7 @@ def customer_recs(customer_id: int, request: Request,
     _guard(request, x_api_key, restaurant_id)
     eng = get_engine()
     res = eng.for_customer(customer_id, restaurant_id, top_k=top_k)
+    res = _filter_legacy_result_against_live_menu(res, restaurant_id)
     res["request_id"] = request.state.request_id
     return res
 
@@ -964,9 +1125,19 @@ def record_event(ev: RecommendationEvent, request: Request, x_api_key: str = Hea
     # Keep event logging available during kill switch periods while enforcing auth/rate limits.
     if not check_api_key(x_api_key):
         raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
-    key = x_api_key or (request.client.host if request.client else "anon")
-    if not rate_limit_ok(key):
+    if not rate_limit_ok(_client_rate_key(request), scope="events"):
         raise HTTPException(status_code=429, detail="rate limit exceeded")
+    if not tenant_allowed(x_api_key, ev.restaurant_id):
+        raise HTTPException(status_code=403, detail="restaurant not allowed for this API key")
+    # Validate against the current active catalog, not the training artifact. This
+    # also supports restaurants and new items introduced after model training.
+    live_menu = _live_menu_payload(int(ev.restaurant_id), include_inactive=False, fresh=False)
+    restaurant_items = {int(item["item_id"]) for item in live_menu["items"]}
+    if int(ev.recommended_item_id) not in restaurant_items:
+        raise HTTPException(status_code=422, detail="recommended item does not belong to restaurant")
+    invalid_cart_items = sorted(set(int(item_id) for item_id in ev.cart_item_ids) - restaurant_items)
+    if invalid_cart_items:
+        raise HTTPException(status_code=422, detail="cart contains items outside restaurant")
     row = ev.model_dump()
     if not row.get("request_id"):
         row["request_id"] = request.state.request_id
@@ -976,8 +1147,15 @@ def record_event(ev: RecommendationEvent, request: Request, x_api_key: str = Hea
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     path = EVENTS_DIR / f"events-{day}.jsonl"
     try:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        encoded_row = json.dumps(row, ensure_ascii=False) + "\n"
+        with _EVENTS_WRITE_LOCK:
+            current_size = path.stat().st_size if path.exists() else 0
+            if current_size + len(encoded_row.encode("utf-8")) > EVENTS_MAX_BYTES_PER_DAY:
+                raise HTTPException(status_code=507, detail="daily event storage limit reached")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(encoded_row)
+    except HTTPException:
+        raise
     except Exception:
         log.exception("request_id=%s failed to persist event", request.state.request_id)
         raise HTTPException(status_code=500, detail="failed to store event")
@@ -1050,21 +1228,24 @@ def demo_restaurant_menu(restaurant_id: int):
 
 
 @app.get("/demo/restaurants")
-def demo_restaurants():
-    """All restaurants from the live DB for the menu trial selector."""
-    rows = fetch_restaurants().fillna("").to_dict(orient="records")
-    return {"restaurants": rows, "count": len(rows), "source": "database"}
+def demo_restaurants(request: Request):
+    """Restaurants with a current menu and at least one active item."""
+    _guard_public_read(request)
+    return _cached_restaurants_payload()
 
 
 @app.get("/demo/restaurants/{restaurant_id}/live-menu")
-def demo_live_restaurant_menu(restaurant_id: int, include_inactive: bool = True):
-    """Complete live menu for a restaurant, including items not in model artifacts."""
-    restaurants = fetch_restaurants()
-    match = restaurants[restaurants["restaurant_id"] == int(restaurant_id)]
-    if match.empty:
-        raise HTTPException(status_code=404, detail="restaurant not found")
-    items = fetch_restaurant_menu(restaurant_id, include_inactive=include_inactive)
-    records = items.fillna("").to_dict(orient="records")
+def demo_live_restaurant_menu(
+    restaurant_id: int,
+    request: Request,
+    include_inactive: bool = False,
+):
+    """Public demo view of the active menu only."""
+    _guard_public_read(request)
+    if include_inactive:
+        raise HTTPException(status_code=403, detail="inactive menu items are not public")
+    live_menu = _live_menu_payload(restaurant_id, include_inactive=False)
+    records = [dict(item) for item in live_menu["items"]]
     # UI-compatible fields. Signals are filled by the model only when it knows the item.
     for item in records:
         item.update({"has_cross_sell": False, "has_similar_alternatives": False, "popularity_rank": None})
@@ -1073,31 +1254,41 @@ def demo_live_restaurant_menu(restaurant_id: int, include_inactive: bool = True)
         category_id = item.get("category_id")
         key = str(category_id) if category_id != "" else "uncategorized"
         categories[key] = categories.get(key, 0) + 1
-    restaurant = match.iloc[0].fillna("").to_dict()
+    restaurant = live_menu["restaurant"]
     return {
         "restaurant_id": int(restaurant_id),
         "restaurant_name": restaurant.get("name_ar") or restaurant.get("name") or f"Restaurant {restaurant_id}",
         "items": records,
         "categories": [{"category_id": key, "category": f"الفئة {key}", "count": count} for key, count in categories.items()],
         "default_cart_item_ids": [records[0]["item_id"]] if records else [],
-        "source": "database",
-        "include_inactive": include_inactive,
+        "source": "live_database",
+        "include_inactive": False,
     }
 
 
 @app.get("/api/menu/restaurants")
-def menu_restaurants(fresh: bool = False):
+def menu_restaurants(request: Request, fresh: bool = False):
     """Live restaurant selector for the Lovable menu project (read-only)."""
+    _guard_public_read(request, fresh=fresh)
     return _cached_restaurants_payload(fresh=fresh)
 
 
 @app.get("/api/menu/restaurants/{restaurant_id}/items")
-def menu_items(restaurant_id: int, include_inactive: bool = False, fresh: bool = False):
+def menu_items(
+    restaurant_id: int,
+    request: Request,
+    include_inactive: bool = False,
+    fresh: bool = False,
+):
     """Live menu from the DB, grouped per item with its available sizes/prices."""
-    return _live_menu_payload(restaurant_id, include_inactive, fresh=fresh)
+    _guard_public_read(request, fresh=fresh)
+    if include_inactive:
+        raise HTTPException(status_code=403, detail="inactive menu items are not public")
+    return _live_menu_payload(restaurant_id, include_inactive=False, fresh=fresh)
 
 
 @app.get("/api/menu/restaurants/{restaurant_id}/items/{item_id}/availability")
-def menu_item_availability(restaurant_id: int, item_id: int):
+def menu_item_availability(restaurant_id: int, item_id: int, request: Request):
     """Fresh, lightweight stock check for one item before accepting it."""
+    _guard_public_read(request, fresh=True, rate_scope="availability")
     return _live_item_availability_payload(restaurant_id, item_id)

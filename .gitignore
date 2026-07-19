@@ -20,6 +20,14 @@ venv/
 artifacts/
 *.csv
 *.log
+*.joblib.tmp
+reports/events/
+.codex-deploy/
+ToCoun/node_modules/
+ToCoun/menus/
+ToCoun/_*.json
+ToCoun/_*.png
+ToCoun/Final/*.xlsx
 
 # ===== OS =====
 Thumbs.db

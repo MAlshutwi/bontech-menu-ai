@@ -4,10 +4,13 @@ All helpers are SELECT-only. No production database writes.
 """
 from __future__ import annotations
 
+import os
+import time
+
 import pandas as pd
 from sqlalchemy import create_engine, text
 
-from .config import CLEANING, db_url
+from .config import CFG, CLEANING, db_url
 
 _engine = None
 
@@ -19,7 +22,10 @@ def get_engine():
         _engine = create_engine(
             db_url(),
             pool_pre_ping=True,
-            connect_args={"options": "-c default_transaction_read_only=on"},
+            connect_args={
+                "options": "-c default_transaction_read_only=on",
+                "connect_timeout": 3,
+            },
         )
     return _engine
 
@@ -34,6 +40,12 @@ def q(sql: str, **params) -> pd.DataFrame:
         raise ValueError("q() rejects multiple SQL statements")
     with get_engine().connect() as connection:
         return pd.read_sql(text(sql), connection, params=params)
+
+
+def check_database_connection() -> bool:
+    """Run the smallest possible read-only query for readiness checks."""
+    with get_engine().connect() as connection:
+        return connection.execute(text("SELECT 1")).scalar_one() == 1
 
 
 def _clean_where() -> str:
@@ -80,8 +92,18 @@ def fetch_clean_lines_cached(refresh: bool = False) -> pd.DataFrame:
     from .config import ARTIFACTS
 
     path = ARTIFACTS / "_clean_lines.parquet"
-    if path.exists() and not refresh:
-        return pd.read_parquet(path)
+    configured_hours = os.environ.get(
+        "CLEAN_LINES_CACHE_MAX_AGE_HOURS",
+        (CFG.get("training") or {}).get("clean_cache_max_age_hours", 24),
+    )
+    try:
+        max_age_seconds = max(0.0, float(configured_hours)) * 60 * 60
+    except (TypeError, ValueError):
+        max_age_seconds = 24 * 60 * 60
+    if path.exists() and not refresh and max_age_seconds > 0:
+        age_seconds = max(0.0, time.time() - path.stat().st_mtime)
+        if age_seconds <= max_age_seconds:
+            return pd.read_parquet(path)
     frame = fetch_clean_lines()
     frame.to_parquet(path, index=False)
     return frame
@@ -124,12 +146,25 @@ def fetch_restaurants_with_menu_counts() -> pd.DataFrame:
                COALESCE(NULLIF(r.title_en,''), r.shortname, 'rest_' || r.id) AS name,
                COALESCE(NULLIF(r.title_ar,''), '') AS name_ar,
                COUNT(DISTINCT mi.id) AS total_item_count,
-               COUNT(DISTINCT mi.id) FILTER (
-                   WHERE COALESCE(mi.ispublished, false) = true
-                     AND COALESCE(mi.isdeleted, false) = false
-               ) AS active_item_count
+               COUNT(DISTINCT mi.id) AS active_item_count
         FROM restaurants r
-        LEFT JOIN menuitem mi ON mi.restaurantsid = r.id
+        JOIN LATERAL (
+            SELECT rm.id
+            FROM restaurantmenu rm
+            WHERE rm.restaurantid = r.id
+              AND COALESCE(rm.isdefault, false) = true
+              -- Legacy menus may store NULL here. A default, published, non-deleted
+              -- menu is active unless it is explicitly marked false.
+              AND COALESCE(rm.isactive, true) = true
+              AND COALESCE(rm.ispuplish, false) = true
+              AND COALESCE(rm.isdeleted, false) = false
+            ORDER BY COALESCE(rm.updated, rm.created) DESC, rm.id DESC
+            LIMIT 1
+        ) current_menu ON true
+        JOIN menuitem mi
+          ON mi.restaurantsid = r.id
+         AND COALESCE(mi.ispublished, false) = true
+         AND COALESCE(mi.isdeleted, false) = false
         GROUP BY r.id, r.title_en, r.title_ar, r.shortname
         ORDER BY r.id
     """)
@@ -170,7 +205,7 @@ def fetch_restaurant_item_availability(restaurant_id: int, item_id: int) -> pd.D
             FROM restaurantmenu rm
             WHERE rm.restaurantid = :restaurant_id
               AND COALESCE(rm.isdefault, false) = true
-              AND COALESCE(rm.isactive, false) = true
+              AND COALESCE(rm.isactive, true) = true
               AND COALESCE(rm.ispuplish, false) = true
               AND COALESCE(rm.isdeleted, false) = false
             ORDER BY COALESCE(rm.updated, rm.created) DESC, rm.id DESC
@@ -189,7 +224,8 @@ def fetch_restaurant_item_availability(restaurant_id: int, item_id: int) -> pd.D
                availability.availabilityvalue AS availability_value,
                availability.curruntvalue AS current_availability_value
         FROM restaurants r
-        LEFT JOIN menuitem mi
+        JOIN current_menu cm ON true
+        JOIN menuitem mi
                ON mi.restaurantsid = r.id
               AND mi.id = :item_id
               AND COALESCE(mi.ispublished, false) = true
@@ -204,8 +240,8 @@ def fetch_restaurant_item_availability(restaurant_id: int, item_id: int) -> pd.D
                    ias.availabilityvalue,
                    ias.curruntvalue
             FROM itemsavailabilitysettings ias
-            JOIN current_menu cm ON cm.id = ias.menuid
             WHERE COALESCE(ias.isdeleted, false) = false
+              AND ias.menuid = cm.id
               AND ias.restaurantsizesid = isz.restaurantsizesid
               AND (ias.menuitemid = mi.id OR ias.menuitemid IS NULL)
             ORDER BY (ias.menuitemid IS NOT NULL) DESC,
@@ -240,7 +276,7 @@ def fetch_restaurant_menu_with_sizes(
             FROM restaurantmenu rm
             WHERE rm.restaurantid = :restaurant_id
               AND COALESCE(rm.isdefault, false) = true
-              AND COALESCE(rm.isactive, false) = true
+              AND COALESCE(rm.isactive, true) = true
               AND COALESCE(rm.ispuplish, false) = true
               AND COALESCE(rm.isdeleted, false) = false
             ORDER BY COALESCE(rm.updated, rm.created) DESC, rm.id DESC
@@ -273,6 +309,7 @@ def fetch_restaurant_menu_with_sizes(
                availability.availabilityvalue AS availability_value,
                availability.curruntvalue AS current_availability_value
         FROM restaurants r
+        JOIN current_menu cm ON true
         LEFT JOIN menuitem mi
                ON mi.restaurantsid = r.id
               {item_active_filter}
@@ -287,8 +324,8 @@ def fetch_restaurant_menu_with_sizes(
                    ias.availabilityvalue,
                    ias.curruntvalue
             FROM itemsavailabilitysettings ias
-            JOIN current_menu cm ON cm.id = ias.menuid
             WHERE COALESCE(ias.isdeleted, false) = false
+              AND ias.menuid = cm.id
               AND ias.restaurantsizesid = isz.restaurantsizesid
               AND (ias.menuitemid = mi.id OR ias.menuitemid IS NULL)
             ORDER BY (ias.menuitemid IS NOT NULL) DESC,

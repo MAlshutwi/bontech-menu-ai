@@ -32,10 +32,16 @@ def _norm_title_str(s) -> str:
 
 
 class Recommender:
-    def __init__(self):
+    def __init__(self, *, load_customer_profiles: bool | None = None):
         self.model_version = MODEL_VERSION
         self.only_available = bool(SERVING.get("only_items_available_in_restaurant", True))
         self.exclude_in_cart = bool(SERVING.get("exclude_items_in_cart", True))
+        self.candidate_pool_size = max(10, min(int(SERVING.get("candidate_pool_size", 40)), 100))
+        self.load_customer_profiles = bool(
+            CUSTOMER.get("enabled", False)
+            if load_customer_profiles is None
+            else load_customer_profiles
+        )
         # Categories that may be recommended repeatedly, configured for items such as drinks.
         self.repeatable = set(int(c) for c in CUSTOMER.get("repeatable_categories", []) if str(c).strip())
         self._load()
@@ -51,10 +57,12 @@ class Recommender:
             rest_items_df = pd.read_parquet(A / "restaurant_items.parquet")
         except Exception:
             rest_items_df = mapping[["restaurant_id", "item_id"]].copy()
-        try:
-            profiles = pd.read_parquet(A / "customer_profiles.parquet")
-        except Exception:
-            profiles = pd.DataFrame(columns=["customer_id", "top_items", "restaurants"])
+        profiles = pd.DataFrame(columns=["customer_id", "top_items", "restaurants"])
+        if self.load_customer_profiles:
+            try:
+                profiles = pd.read_parquet(A / "customer_profiles.parquet")
+            except Exception:
+                pass
         try:
             recency = pd.read_parquet(A / "item_recency.parquet")
         except Exception:
@@ -99,7 +107,7 @@ class Recommender:
         self.group_local = {}
         for rid, items in self.rest_items.items():
             gl = {}
-            for it in items:
+            for it in sorted(items):
                 gid = self.item_group.get(it)
                 if gid is not None:
                     gl.setdefault(gid, it)
@@ -112,6 +120,9 @@ class Recommender:
                 "b": int(r.item_b), "hybrid": _f(r.hybrid_score), "pc": int(r.pair_count),
                 "conf": _f(r.confidence), "lift": _f(r.lift),
             })
+        for table in self.fbt.values():
+            for candidates in table.values():
+                candidates.sort(key=lambda row: (-row["hybrid"], row["b"]))
 
         # Popularity: restaurant -> {item: score} plus a sorted list.
         self.pop_score = {}
@@ -120,11 +131,11 @@ class Recommender:
             self.pop_score.setdefault(int(r.restaurant_id), {})[int(r.item_id)] = _f(r.score)
             self.pop_rank.setdefault(int(r.restaurant_id), []).append((int(r.item_id), _f(r.score)))
         for rid in self.pop_rank:
-            self.pop_rank[rid].sort(key=lambda x: x[1], reverse=True)
+            self.pop_rank[rid].sort(key=lambda x: (-x[1], x[0]))
 
         # Global common items as a sorted list of (group_id, score).
         self.global_groups = [(int(r.common_group_id), _f(r.score)) for r in gpop.itertuples()]
-        self.global_groups.sort(key=lambda x: x[1], reverse=True)
+        self.global_groups.sort(key=lambda x: (-x[1], x[0]))
 
         # recency: rest -> {item: score}
         self.recency = {}
@@ -168,6 +179,9 @@ class Recommender:
                     self.titles.setdefault(int(r.item_id), (r.item_title or "", ""))
             except Exception:
                 pass
+        for table in self.sim_alt.values():
+            for candidates in table.values():
+                candidates.sort(key=lambda row: (-row[1], row[0]))
         self.pooled = {}
         self.pooled_enabled = bool(self.p10.get("pooled_fbt_fallback", {}).get("enabled"))
         if self.pooled_enabled:
@@ -176,7 +190,7 @@ class Recommender:
                 for r in pf.itertuples():
                     self.pooled.setdefault(int(r.group_a), []).append((int(r.group_b), _f(r.confidence)))
                 for gg in self.pooled:
-                    self.pooled[gg].sort(key=lambda x: x[1], reverse=True)
+                    self.pooled[gg].sort(key=lambda x: (-x[1], x[0]))
             except Exception:
                 pass
 
@@ -295,11 +309,37 @@ class Recommender:
 
     # ---------------- Main recommendation interface ----------------
     def _valid_cart_for_restaurant(self, rid, cart_items):
-        cart = [int(x) for x in (cart_items or [])]
+        cart = list(dict.fromkeys(int(x) for x in (cart_items or [])))
         available = self.rest_items.get(int(rid), set())
         if not available:
             return cart
         return [item_id for item_id in cart if item_id in available]
+
+    def _menu_cart_fallback_scores(self, rid, cart):
+        """Return weak, category-aware menu candidates for sparse restaurants."""
+        available = self.rest_items.get(rid, set())
+        if not available:
+            return {}
+        cart_categories = {
+            self.item_category[item_id]
+            for item_id in cart
+            if item_id in self.item_category
+        }
+        popularity = self.pop_score.get(rid, {})
+        max_popularity = max(popularity.values(), default=0.0)
+        scores = {}
+        for item_id in sorted(available):
+            if item_id in cart:
+                continue
+            category_id = self.item_category.get(item_id)
+            category_complement = category_id is not None and category_id not in cart_categories
+            normalized_popularity = (
+                max(0.0, popularity.get(item_id, 0.0)) / max_popularity
+                if max_popularity > 0
+                else 0.0
+            )
+            scores[item_id] = 0.12 + (0.08 if category_complement else 0.0) + (0.03 * normalized_popularity)
+        return scores
 
     def recommend(
         self,
@@ -324,6 +364,7 @@ class Recommender:
             ps = self._pooled_scores(rid, cart)
             if ps:
                 fbt_s, pooled_used = ps, True
+        menu_fallback_used = False
         if cart_only:
             # Once a cart exists, rank cross-sell candidates only from cart
             # co-occurrence. Popularity remains an empty-cart discovery signal,
@@ -333,7 +374,11 @@ class Recommender:
             cust_s = {}
             rec_s = {}
             ta_s = {}
-            cands = set(fbt_s)
+            menu_s = {}
+            if not fbt_s and cart:
+                menu_s = self._menu_cart_fallback_scores(rid, cart)
+                menu_fallback_used = bool(menu_s)
+            cands = set(fbt_s) | set(menu_s)
         else:
             pop_s = self._pop_scores(rid)
             glob_s = self._global_scores(rid)
@@ -348,7 +393,10 @@ class Recommender:
             if self.only_available and avail and it not in avail:
                 continue
             if cart_only:
-                contrib = {"restaurant_fbt": fbt_s.get(it, 0.0)}
+                contrib = {
+                    "restaurant_fbt": fbt_s.get(it, 0.0),
+                    "live_menu_fallback": menu_s.get(it, 0.0),
+                }
             else:
                 contrib = {
                     "restaurant_fbt": weights["restaurant_fbt"] * fbt_s.get(it, 0.0),
@@ -366,8 +414,13 @@ class Recommender:
                 source = "pooled_fbt"
             scored.append((it, total, source, contrib))
 
-        scored.sort(key=lambda x: x[1], reverse=True)
-        fallback_used = len(fbt_s) == 0 or (bool(requested_cart) and not cart)
+        scored.sort(key=lambda x: (-x[1], x[0]))
+        fallback_used = bool(
+            pooled_used
+            or menu_fallback_used
+            or len(fbt_s) == 0
+            or (bool(requested_cart) and not cart)
+        )
 
         # Deduplicate by common group or normalized title to avoid duplicate display items.
         # Repeatable items are not suppressed just because they are already in the cart.
@@ -444,6 +497,7 @@ class Recommender:
         "recency": "رائج مؤخرًا في هذا المطعم",
         "time_based": "مناسب لوقت الطلب الحالي",
         "pooled_fbt": "شائع مع أصناف سلتك عبر مطاعم مشابهة",
+        "live_menu_fallback": "اقتراح تكميلي من أقسام المنيو المتاحة",
     }
 
     def _format(self, it, score, source, ev):
@@ -593,7 +647,7 @@ class Recommender:
                     continue
                 agg[alt] = max(agg.get(alt, 0.0), sim)  # Nearest alternative for any cart item.
         out, seen = [], set(self._dedup_key(c) for c in cart)
-        for alt, sim in sorted(agg.items(), key=lambda x: x[1], reverse=True):
+        for alt, sim in sorted(agg.items(), key=lambda x: (-x[1], x[0])):
             if self.only_available and avail and alt not in avail:
                 continue
             k = self._dedup_key(alt)
@@ -617,7 +671,7 @@ class Recommender:
         avail = self.rest_items.get(rid, set())
         out, seen = [], set(self._dedup_key(c) for c in cart
                             if self.item_category.get(c) not in self.repeatable)
-        for it, sc in sorted(ta.items(), key=lambda x: x[1], reverse=True):
+        for it, sc in sorted(ta.items(), key=lambda x: (-x[1], x[0])):
             if it in cart or (self.only_available and avail and it not in avail):
                 continue
             k = self._dedup_key(it)
@@ -631,7 +685,7 @@ class Recommender:
 
     def _global_list(self, rid, cart, top_k):
         out, seen = [], set(self._dedup_key(c) for c in cart)
-        for it, sc in sorted(self._global_scores(rid).items(), key=lambda x: x[1], reverse=True):
+        for it, sc in sorted(self._global_scores(rid).items(), key=lambda x: (-x[1], x[0])):
             if it in cart:
                 continue
             k = self._dedup_key(it)

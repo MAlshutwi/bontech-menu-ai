@@ -3,7 +3,7 @@ app/schemas.py - Pydantic v2 request/response models and validation.
 """
 from __future__ import annotations
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 
 
@@ -21,12 +21,30 @@ class RequestContext(BaseModel):
 
 
 class RecommendationRequest(BaseModel):
-    restaurant_id: int = Field(..., ge=1)
-    customer_id: Optional[int] = Field(None, ge=1)
-    cart_item_ids: List[int] = Field(default_factory=list)
-    top_k: int = Field(5, ge=1, le=50)
-    include_types: Optional[List[str]] = None   # Phase 10 rails to return.
+    model_config = ConfigDict(extra="forbid")
+
+    restaurant_id: StrictInt = Field(..., ge=1)
+    customer_id: Optional[StrictInt] = Field(None, ge=1)
+    cart_item_ids: List[StrictInt] = Field(default_factory=list)
+    top_k: StrictInt = Field(5, ge=1, le=50)
+    include_types: Optional[
+        List[Literal["cross_sell", "similar_alternative", "popular"]]
+    ] = Field(None, min_length=1, max_length=3)
     context: Optional[RequestContext] = None
+
+    @field_validator("cart_item_ids")
+    @classmethod
+    def recommendation_cart_ids_must_be_positive(cls, value):
+        if any(item_id < 1 for item_id in value):
+            raise ValueError("cart_item_ids must contain positive integers")
+        return value
+
+    @field_validator("include_types")
+    @classmethod
+    def include_types_must_be_unique(cls, value):
+        if value is not None and len(value) != len(set(value)):
+            raise ValueError("include_types must not contain duplicates")
+        return value
 
 
 class RecommendationItem(BaseModel):
@@ -148,6 +166,8 @@ class HealthResponse(BaseModel):
     kill_switch_active: bool = False
     kill_switch_reason: Optional[str] = None
     api_key_required: bool = False
+    database_ready: bool = True
+    readiness_checked_at: Optional[str] = None
 
 
 class EventType(str, Enum):
@@ -159,16 +179,18 @@ class EventType(str, Enum):
 
 
 class RecommendationEvent(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     event_type: EventType
-    restaurant_id: int = Field(..., ge=1)
-    recommended_item_id: int = Field(..., ge=1)
-    source: str = Field(..., max_length=64)
+    restaurant_id: StrictInt = Field(..., ge=1)
+    recommended_item_id: StrictInt = Field(..., ge=1)
+    source: str = Field(..., min_length=1, max_length=64)
     # Request/session identity.
     request_id: Optional[str] = Field(None, max_length=64)
     session_id: Optional[str] = Field(None, max_length=64)
-    customer_id: Optional[int] = Field(None, ge=1)
-    order_id: Optional[int] = Field(None, ge=1)
-    cart_item_ids: List[int] = Field(default_factory=list, max_length=200)
+    customer_id: Optional[StrictInt] = Field(None, ge=1)
+    order_id: Optional[StrictInt] = Field(None, ge=1)
+    cart_item_ids: List[StrictInt] = Field(default_factory=list, max_length=50)
     recommendation_type: Optional[str] = Field(None, max_length=32)
     experiment_id: Optional[str] = Field(None, max_length=64)
     surface: Optional[str] = Field(None, max_length=32)   # cart / checkout / item_page ...
@@ -179,6 +201,15 @@ class RecommendationEvent(BaseModel):
     pos_id: Optional[str] = Field(None, max_length=64)
     variant: Optional[str] = Field(None, max_length=64)
     timestamp: Optional[str] = Field(None, max_length=64)
+
+    @field_validator("cart_item_ids")
+    @classmethod
+    def event_cart_ids_must_be_positive_and_unique(cls, value):
+        if any(item_id < 1 for item_id in value):
+            raise ValueError("cart_item_ids must contain positive integers")
+        if len(value) != len(set(value)):
+            raise ValueError("cart_item_ids must not contain duplicates")
+        return value
 
 
 class EventAck(BaseModel):

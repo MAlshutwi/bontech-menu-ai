@@ -1,0 +1,637 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>BonTech Restaurant Menu Demo</title>
+  <link rel="stylesheet" href="smart-suggestions-widget.css"/>
+  <link rel="stylesheet" href="/demo/widget/smart-suggestions-widget.css"/>
+  <style>
+    :root{
+      --ink:#081815;--muted:#6b7870;--line:#eadfce;--line-strong:#d8c9b5;
+      --surface:#fffdf9;--canvas:#fff4e6;--navy:#1d2637;--accent:#ff856f;
+      --green:#156f4f;--danger:#d83b32;--shadow:0 8px 24px rgba(29,38,55,.10)
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{margin:0;background:var(--canvas);color:var(--ink);font-family:Inter,"Segoe UI",Tahoma,Arial,sans-serif;overflow:hidden}
+    button,input,select,a{font:inherit}
+    button{border:0;border-radius:999px;background:var(--accent);color:#fff;padding:10px 14px;font-weight:900;cursor:pointer}
+    button.secondary{background:var(--navy)}
+    button.ghost{background:#fff;color:var(--ink);border:1px solid var(--line)}
+    button.danger{background:var(--danger)}
+    button:disabled{opacity:.5;cursor:not-allowed}
+    .app{height:100%;display:flex;flex-direction:column}
+    header{background:var(--surface);border-bottom:1px solid var(--line);padding:14px 18px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:16px;align-items:center}
+    h1{font-size:23px;margin:0}.meta{font-size:12px;color:var(--muted);margin-top:4px}
+    .top-actions{display:flex;gap:8px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+    .field{display:flex;align-items:center;gap:8px;background:#fff;border:1px solid var(--line);border-radius:999px;padding:6px 10px}
+    .field label{font-size:12px;color:var(--muted);font-weight:900;white-space:nowrap}
+    .field input{width:170px;border:0;outline:0;background:transparent;color:var(--ink);direction:ltr;text-align:left}
+    .layout{direction:ltr;flex:1;min-height:0;display:grid;grid-template-columns:340px minmax(0,1fr);gap:16px;padding:16px;max-width:1740px;width:100%;margin:0 auto}
+    aside,.menu-shell{direction:rtl;min-height:0}
+    aside{background:var(--surface);border:1px solid var(--line);border-radius:0 0 18px 18px;box-shadow:var(--shadow);display:flex;flex-direction:column;overflow:hidden}
+    .cart-head{background:var(--navy);color:#fff;padding:14px 16px;display:flex;justify-content:space-between;align-items:center}
+    .cart-head h2{font-size:18px;margin:0}.mode{background:#fff;color:var(--navy);border-radius:8px;padding:6px 10px;font-size:12px;font-weight:900}
+    .guest-strip{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;font-weight:900}
+    .guest-strip span{font-size:12px;color:var(--muted);font-weight:700}
+    .cart-body{padding:14px;display:flex;flex-direction:column;gap:12px;flex:1;min-height:0}
+    .cart-list{display:flex;flex-direction:column;gap:9px;overflow:auto;min-height:0;flex:1}
+    .cart-row{background:#fffaf4;border:1px solid var(--line);border-radius:14px;padding:11px;display:flex;justify-content:space-between;gap:10px}
+    .cart-row strong{font-size:13px;line-height:1.25;overflow-wrap:anywhere}.cart-row span{font-size:12px;color:var(--muted)}
+    .qty-tools{display:flex;gap:6px;margin-top:8px}.qty-btn{width:28px;height:28px;border-radius:8px;padding:0;background:#fff;color:var(--ink);border:1px solid var(--line)}
+    .cart-empty{min-height:220px;display:grid;place-items:center;text-align:center;color:var(--muted);line-height:1.7}
+    .status{border:1px solid var(--line);border-radius:14px;background:#fffdf9;padding:10px 12px;color:var(--muted);font-size:12px;line-height:1.55}
+    .status.good{border-color:#bfe2d2;background:#f1fbf6;color:#226b50}.status.warn{border-color:#ead089;background:#fff9dd;color:#876200}.status.bad{border-color:#f3b2a8;background:#fff3ef;color:#9f3028}
+    .menu-shell{display:flex;flex-direction:column;overflow:hidden}
+    .demo-note{border:1px dashed var(--line-strong);background:#fffaf4;border-radius:14px;padding:10px 12px;color:#6f655a;font-size:12px;line-height:1.6;margin-bottom:12px}
+    .quality-strip{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:12px}
+    .quality-card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:10px 12px;min-height:70px}
+    .quality-card span{display:block;color:var(--muted);font-size:12px;font-weight:800}
+    .quality-card strong{display:block;color:var(--ink);font-size:22px;margin-top:3px;direction:ltr;text-align:right}
+    .quality-card small{display:block;color:var(--muted);font-size:11px;margin-top:2px;line-height:1.35}
+    .menu-head{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;margin-bottom:12px}
+    .menu-head h2{font-size:20px;margin:0}.sub{font-size:12px;color:var(--muted);margin-top:3px}
+    .searchbar{display:grid;grid-template-columns:minmax(220px,1fr) 160px 120px;gap:10px;margin-bottom:12px}
+    .searchbar input,.searchbar select{border:1px solid var(--line);border-radius:13px;background:#fff;padding:10px 12px;color:var(--ink);outline:0}
+    .category-rail{display:flex;gap:10px;overflow:auto;padding:0 0 12px;scrollbar-width:thin}
+    .cat-pill{background:#fff;color:var(--ink);border:1px solid var(--line);white-space:nowrap}
+    .cat-pill.active{background:#ffe3d9;border-color:#ffad98;color:#d7553d}
+    .cat-pill span{display:inline-grid;place-items:center;min-width:24px;height:24px;border-radius:999px;background:#f1ece3;color:#6f655a;margin-right:6px;font-size:12px}
+    .content-row{display:flex;min-height:0;flex:1}
+    .menu-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(246px,1fr));gap:14px;overflow:auto;min-height:0;padding:2px 4px 18px;scrollbar-width:thin;flex:1}
+    .item-card{background:var(--surface);border:1px solid var(--line);border-radius:18px;overflow:hidden;box-shadow:0 3px 10px rgba(29,38,55,.08);min-height:282px;display:flex;flex-direction:column}
+    .item-card.in-cart{border-color:var(--accent);box-shadow:0 0 0 2px rgba(255,133,111,.22),0 8px 18px rgba(29,38,55,.10)}
+    .visual{height:108px;background:linear-gradient(135deg,#ffe5ca,#ffd1c7 45%,#f4b58f);display:flex;align-items:center;justify-content:center;position:relative;overflow:hidden}
+    .visual:before{content:"";width:92px;height:92px;border-radius:50%;background:rgba(255,255,255,.45);position:absolute;right:28px;top:16px}
+    .visual strong{z-index:1;background:rgba(29,38,55,.85);color:#fff;border-radius:999px;padding:8px 12px;font-size:12px;direction:ltr}
+    .card-body{padding:13px;display:flex;flex-direction:column;gap:11px;flex:1}.title{font-size:15px;font-weight:950;line-height:1.35;min-height:42px}
+    .facts{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px;color:var(--muted)}
+    .fact{background:#fffaf4;border:1px solid var(--line);border-radius:10px;padding:7px}.fact b{display:block;color:var(--ink);font-size:13px;margin-top:2px}
+    .card-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:auto}
+    .rank{font-weight:950}.add-btn{background:#ffd8ca;color:#ef765f;padding:9px 13px}.add-btn.in-cart{background:#e7f4ee;color:var(--green)}
+    .ai-activate{min-width:150px;background:var(--navy)}
+    .testing-link{display:inline-flex;align-items:center;justify-content:center;border:1px solid var(--line);border-radius:999px;background:#fff;color:var(--ink);padding:10px 14px;font-weight:900;text-decoration:none;white-space:nowrap}
+    .recommend-panel{background:var(--surface);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);display:flex;flex-direction:column;overflow:hidden;min-height:0}
+    .recommend-head{padding:13px 14px;background:#fffaf4;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:12px;align-items:center}
+    .recommend-head h3{margin:0;font-size:16px}.recommend-body{padding:12px;overflow:auto;display:flex;flex-direction:column;gap:11px}
+    .section-title{font-size:12px;color:var(--muted);font-weight:950;margin:4px 0}
+    .rec-item{border:1px solid var(--line);border-radius:14px;background:#fff;padding:10px;display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+    .rec-item strong{font-size:13px;line-height:1.35}.rec-item span{display:block;color:var(--muted);font-size:12px;margin-top:3px}.rec-item button{padding:7px 10px}
+    .pct-badge{display:inline-flex;align-items:center;justify-content:center;min-width:58px;border-radius:999px;background:#eef7f2;color:#146248;border:1px solid #bfe2d2;padding:4px 8px;font-size:11px;font-weight:950;direction:ltr;margin-top:7px}
+    pre{direction:ltr;text-align:left;white-space:pre-wrap;overflow:auto;max-height:180px;background:#111820;color:#e9edf2;border-radius:12px;padding:10px;font-size:11px}
+    .empty{border:1px dashed var(--line-strong);border-radius:18px;background:#fffdf9;color:var(--muted);padding:18px;text-align:center;font-size:13px;line-height:1.6}
+    @media (max-width:1100px){
+      html,body{height:auto;min-height:100%}
+      body{overflow:auto}
+      .app{height:auto;min-height:100vh;overflow:visible}
+      .layout{display:block;min-height:auto;overflow:visible;padding-bottom:28px}
+      aside{min-height:auto;overflow:visible;margin-bottom:16px}
+      .cart-body,.cart-list{min-height:auto;overflow:visible}
+      .cart-list{flex:none}
+      .menu-shell{overflow:visible;min-height:auto}
+      .content-row{display:block;min-height:auto;overflow:visible}
+      .menu-grid{overflow:visible;min-height:auto}
+      .recommend-panel{margin-top:14px;overflow:visible;min-height:auto}
+      .recommend-body{overflow:visible}
+    }
+    @media (max-width:640px){
+      header{grid-template-columns:1fr;position:relative}
+      .top-actions{justify-content:flex-start}
+      .top-actions .testing-link,.top-actions button{width:100%}
+      .field{width:100%;border-radius:14px}
+      .field input{width:100%}
+      .searchbar{grid-template-columns:1fr}
+      .layout{padding:12px}
+      .quality-strip{grid-template-columns:1fr}
+      .menu-head{flex-direction:column;align-items:stretch}
+      .menu-head button{width:100%}
+      .menu-grid{grid-template-columns:1fr}
+      .item-card{min-height:auto}
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div>
+        <h1 id="restaurantName">BonTech Restaurant Menu Demo</h1>
+        <div class="meta" id="restaurantMeta">جاري تجهيز المنيو تلقائيًا</div>
+      </div>
+      <div class="top-actions">
+        <input id="apiBaseUrl" type="hidden"/>
+        <input id="restaurantId" type="hidden" value="277"/>
+        <a class="testing-link" href="https://trybt.alshutwi.me">الإرجاع للتيستنق</a>
+        <button class="secondary ai-activate" id="openWidgetBtn" disabled>تفعيل الـ AI</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <aside>
+        <div class="cart-head">
+          <h2>عربة الوجبات الجاهزة</h2>
+          <span class="mode">سفري</span>
+        </div>
+        <div class="guest-strip">
+          <strong>معلومات الضيف</strong>
+          <span>اختياري</span>
+        </div>
+        <div class="cart-body">
+          <div id="cartEmpty" class="cart-empty">عربة التسوق فارغة<br/>أضف صنفًا من المنيو لتجربة التوصيات</div>
+          <div id="cartList" class="cart-list"></div>
+        </div>
+      </aside>
+
+      <section class="menu-shell">
+        <div class="demo-note">
+          الديمو يستخدم ملف التسليم والويدجت المرفق. صفحة المنيو UI فقط، والاقتراحات تأتي من `POST /api/v1/recommendations`.
+          DB blocker OPEN، وProduction Not Ready.
+        </div>
+        <div class="quality-strip">
+          <div class="quality-card">
+            <span>مطاعم لديها FBT</span>
+            <strong id="fbtCoverage">--</strong>
+            <small>إشارة cross-sell داخل المطعم</small>
+          </div>
+          <div class="quality-card">
+            <span>مطاعم لديها Popularity</span>
+            <strong id="popCoverage">--</strong>
+            <small>fallback وشعبية داخل المطعم</small>
+          </div>
+        </div>
+        <div class="menu-head">
+          <div>
+            <h2>منيو المطعم</h2>
+            <div class="sub" id="menuCounts">جاري تجهيز المنيو</div>
+          </div>
+          <button class="secondary" id="sampleOtherBtn">تجربة مطعم 172</button>
+        </div>
+        <div class="searchbar">
+          <input id="searchInput" placeholder="بحث بالاسم أو item_id"/>
+          <select id="categorySelect">
+            <option value="all">كل التصنيفات</option>
+          </select>
+          <select id="limitSelect">
+            <option value="24">24 صنف</option>
+            <option value="48">48 صنف</option>
+            <option value="96">96 صنف</option>
+          </select>
+        </div>
+        <nav id="categoryRail" class="category-rail" aria-label="Menu categories"></nav>
+        <div id="menuStatus" class="status">جاري تجهيز المنيو تلقائيًا...</div>
+        <div class="content-row" style="margin-top:14px">
+          <div id="menuGrid" class="menu-grid"></div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script id="localWidgetScript" src="smart-suggestions-widget.js?v=ai-toggle-20260709"></script>
+  <script id="serverWidgetScript" src="/demo/widget/smart-suggestions-widget.js?v=ai-toggle-20260709"></script>
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const sameOriginDemo = location.pathname.startsWith("/demo/");
+    const apiCandidates = sameOriginDemo ? [""] : ["http://127.0.0.1:8011", "http://127.0.0.1:8000"];
+    $("apiBaseUrl").value = apiCandidates[0];
+
+    let menuPayload = null;
+    let items = [];
+    let itemById = new Map();
+    let cart = [];
+    let lastAddedItemId = null;
+    let widget = null;
+    let selectedCategory = "all";
+    let lastResponse = null;
+
+    function apiBase(){
+      return $("apiBaseUrl").value.trim().replace(/\/$/, "");
+    }
+
+    function apiUrl(path){
+      return apiBase() + path;
+    }
+
+    function headers(){
+      return {"Content-Type": "application/json"};
+    }
+
+    function loadScript(src){
+      return new Promise((resolve, reject) => {
+        const script = document.createElement("script");
+        script.src = src;
+        script.onload = resolve;
+        script.onerror = () => reject(new Error("failed to load " + src));
+        document.head.appendChild(script);
+      });
+    }
+
+    async function ensureWidgetScript(){
+      if (typeof window.SmartSuggestionsWidget === "function") return;
+      const candidates = [
+        new URL("/demo/widget/smart-suggestions-widget.js", window.location.href).href,
+        new URL("smart-suggestions-widget.js", window.location.href).href,
+        new URL("../widget/smart-suggestions-widget.js", window.location.href).href,
+        apiBase() ? apiUrl("/demo/widget/smart-suggestions-widget.js") : "",
+        ...apiCandidates.filter(Boolean).map((base) => base + "/demo/widget/smart-suggestions-widget.js")
+      ].filter(Boolean);
+      const seen = new Set();
+      for (const src of candidates) {
+        if (seen.has(src)) continue;
+        seen.add(src);
+        try {
+          await loadScript(src);
+          if (typeof window.SmartSuggestionsWidget === "function") return;
+        } catch (_error) {
+        }
+      }
+      throw new Error("Widget script unavailable");
+    }
+
+    async function fetchWithFallback(path, options){
+      const bases = [apiBase(), ...apiCandidates].filter((value, index, arr) => arr.indexOf(value) === index);
+      let lastError = null;
+      for (const base of bases) {
+        try {
+          const res = await fetch(base + path, options);
+          $("apiBaseUrl").value = base;
+          return res;
+        } catch (error) {
+          lastError = error;
+        }
+      }
+      throw lastError || new Error("Failed to fetch");
+    }
+
+    function clampPercent(value){
+      const n = Number(value);
+      if (!Number.isFinite(n)) return null;
+      const percent = n <= 1 ? n * 100 : n;
+      return Math.max(0, Math.min(100, percent));
+    }
+
+    function formatPercent(value){
+      const pct = clampPercent(value);
+      if (pct == null) return "--%";
+      return pct.toFixed(2).replace(/\.00$/, "") + "%";
+    }
+
+    function formatScorePercent(value){
+      const n = Number(value);
+      if (!Number.isFinite(n)) return "--%";
+      const pct = Math.max(0, Math.min(100, n <= 1 ? n * 100 : n));
+      return pct.toFixed(2).replace(/\.00$/, "") + "%";
+    }
+
+    async function loadModelQuality(){
+      try {
+        const res = await fetchWithFallback("/health");
+        if (!res.ok) throw new Error("health endpoint returned " + res.status);
+        const health = await res.json();
+        $("fbtCoverage").textContent = String(health.restaurants_with_fbt ?? "--");
+        $("popCoverage").textContent = String(health.restaurants_with_popularity ?? "--");
+      } catch (_error) {
+        $("fbtCoverage").textContent = "--";
+        $("popCoverage").textContent = "--";
+      }
+    }
+
+    function uniqueIds(values){
+      return [...new Set((values || []).map(Number).filter((id) => Number.isInteger(id) && id > 0))];
+    }
+
+    function setStatus(element, message, type){
+      element.textContent = message;
+      element.className = "status" + (type ? " " + type : "");
+    }
+
+    function itemTitle(itemId){
+      const item = itemById.get(Number(itemId));
+      return item ? (item.title_ar || item.title_en || "item_" + item.item_id) : "item_" + itemId;
+    }
+
+    function syncWidget(){
+      if (!widget) return;
+      widget.options.apiBaseUrl = apiBase();
+      widget.options.restaurantId = Number($("restaurantId").value);
+      widget.onCartChanged({cartItemIds: uniqueIds(cart), lastAddedItemId});
+    }
+
+    async function initWidget(){
+      if (widget) return widget;
+      await ensureWidgetScript();
+      widget = new SmartSuggestionsWidget({
+        apiBaseUrl: apiBase(),
+        restaurantId: Number($("restaurantId").value),
+        locale: "ar",
+        limit: 2,
+        maxVisibleItems: 2,
+        autoOpen: false,
+        onAddRecommendation: function(item){
+          addToCart(Number(item.item_id));
+        }
+      });
+      widget.init();
+      return widget;
+    }
+
+    async function loadMenu(){
+      const restaurantId = Number($("restaurantId").value);
+      setStatus($("menuStatus"), "جاري تجهيز المنيو ...", "");
+      $("openWidgetBtn").disabled = true;
+      $("menuGrid").innerHTML = "";
+      try {
+        await loadModelQuality();
+        const res = await fetchWithFallback(`/demo/restaurants/${restaurantId}/menu`);
+        if (!res.ok) throw new Error(`menu endpoint returned ${res.status}`);
+        menuPayload = await res.json();
+        items = menuPayload.items || [];
+        itemById = new Map(items.map((item) => [Number(item.item_id), item]));
+        $("restaurantName").textContent = menuPayload.restaurant_name || `Restaurant ${restaurantId}`;
+        $("restaurantMeta").textContent = `${menuPayload.items_count || 0} عنصر في المنيو`;
+        $("menuCounts").textContent = `${menuPayload.items_count || 0} عنصر · price_available=${menuPayload.price_available} · availability_available=${menuPayload.availability_available}`;
+        buildCategories();
+        renderMenu();
+        renderCart();
+        $("openWidgetBtn").disabled = false;
+        setStatus($("menuStatus"), menuPayload.disabled_reason || "المنيو جاهز.", menuPayload.disabled_reason ? "warn" : "good");
+        try {
+          await initWidget();
+        } catch (error) {
+          setStatus($("menuStatus"), `Menu loaded, widget load failed: ${error.message || error}`, "warn");
+        }
+      } catch (error) {
+        $("openWidgetBtn").disabled = true;
+        setStatus($("menuStatus"), `فشل تجهيز المنيو: ${error.message || error}`, "bad");
+      }
+    }
+
+    function buildCategories(){
+      const counts = new Map();
+      for (const item of items) {
+        const cid = item.category_id == null ? "none" : String(item.category_id);
+        counts.set(cid, (counts.get(cid) || 0) + 1);
+      }
+      const ordered = [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10);
+      $("categoryRail").innerHTML = [
+        `<button class="cat-pill active" data-category="all">الكل <span>${items.length}</span></button>`,
+        ...ordered.map(([cid, count]) => `<button class="cat-pill" data-category="${cid}">قسم ${cid}<span>${count}</span></button>`)
+      ].join("");
+      $("categorySelect").innerHTML = [
+        `<option value="all">كل التصنيفات</option>`,
+        ...ordered.map(([cid, count]) => `<option value="${cid}">قسم ${cid} (${count})</option>`)
+      ].join("");
+    }
+
+    function filteredItems(){
+      const q = $("searchInput").value.trim().toLowerCase();
+      const limit = Number($("limitSelect").value || 24);
+      return items.filter((item) => {
+        const cid = item.category_id == null ? "none" : String(item.category_id);
+        const hay = `${item.item_id} ${item.title_ar || ""} ${item.title_en || ""}`.toLowerCase();
+        return (selectedCategory === "all" || selectedCategory === cid) && (!q || hay.includes(q));
+      }).slice(0, limit);
+    }
+
+    function renderMenu(){
+      const list = filteredItems();
+      if (!list.length) {
+        $("menuGrid").innerHTML = `<div class="empty">لا توجد أصناف مطابقة.</div>`;
+        return;
+      }
+      $("menuGrid").innerHTML = list.map((item) => {
+        const id = Number(item.item_id);
+        const qty = cart.filter((x) => Number(x) === id).length;
+        const title = item.title_ar || item.title_en || `item_${id}`;
+        const rank = item.popularity_rank ? `#${item.popularity_rank}` : "-";
+        return [
+          `<article class="item-card ${qty ? "in-cart" : ""}" data-item-id="${id}">`,
+          `<div class="visual"><strong>item_id ${id}</strong></div>`,
+          `<div class="card-body">`,
+          `<div class="title">${escapeHtml(title)}</div>`,
+          `<div class="facts">`,
+          `<div class="fact">القسم<b>${item.category_id == null ? "-" : item.category_id}</b></div>`,
+          `<div class="fact">الشعبية<b>${rank}</b></div>`,
+          `</div>`,
+          `<div class="card-foot">`,
+          `<span class="rank">${qty ? "في السلة: " + qty : "جاهز للإضافة"}</span>`,
+          `<button class="add-btn ${qty ? "in-cart" : ""}" data-add="${id}">${qty ? "+ كمية" : "+ إضافة"}</button>`,
+          `</div>`,
+          `</div>`,
+          `</article>`
+        ].join("");
+      }).join("");
+    }
+
+    function renderCart(){
+      const counts = new Map();
+      for (const id of cart) counts.set(Number(id), (counts.get(Number(id)) || 0) + 1);
+      $("cartEmpty").style.display = counts.size ? "none" : "grid";
+      $("cartList").innerHTML = [...counts.entries()].map(([id, qty]) => [
+        `<div class="cart-row">`,
+        `<div><strong>${escapeHtml(itemTitle(id))}</strong><span>item_id ${id}</span>`,
+        `<div class="qty-tools">`,
+        `<button class="qty-btn" data-dec="${id}">-</button>`,
+        `<button class="qty-btn" data-inc="${id}">+</button>`,
+        `</div></div>`,
+        `<span>qty ${qty}</span>`,
+        `</div>`
+      ].join("")).join("");
+      renderMenu();
+    }
+
+    function addToCart(itemId){
+      const id = Number(itemId);
+      cart.push(id);
+      lastAddedItemId = id;
+      renderCart();
+      syncWidget();
+    }
+
+    function decrement(itemId){
+      const id = Number(itemId);
+      const idx = cart.findIndex((x) => Number(x) === id);
+      if (idx >= 0) cart.splice(idx, 1);
+      lastAddedItemId = cart[cart.length - 1] || null;
+      renderCart();
+      syncWidget();
+    }
+
+    async function runRecommendations(useEmpty){
+      const restaurantId = Number($("restaurantId").value);
+      const ids = useEmpty ? [] : uniqueIds(cart);
+      const last = useEmpty ? null : (lastAddedItemId || ids[ids.length - 1] || null);
+      $("recommendations").innerHTML = `<div class="empty">جاري تحميل الاقتراحات...</div>`;
+      try {
+        await initWidget();
+        const res = await fetchWithFallback("/api/v1/recommendations", {
+          method: "POST",
+          headers: headers(),
+          body: JSON.stringify({
+            restaurant_id: restaurantId,
+            cart_item_ids: ids,
+            last_added_item_id: last || undefined,
+            limit: 2
+          })
+        });
+        const payload = await res.json();
+        lastResponse = payload;
+        $("debug").textContent = JSON.stringify(payload, null, 2);
+        if (!res.ok) throw new Error(payload.detail || `recommendation endpoint returned ${res.status}`);
+        renderRecommendations(payload);
+        if (!useEmpty) syncWidget();
+      } catch (error) {
+        $("recommendations").innerHTML = `<div class="empty">فشل تحميل التوصيات: ${escapeHtml(error.message || error)}</div>`;
+      }
+    }
+
+    function renderRecommendations(payload){
+      const items = pickRecommendationItems(payload);
+      const html = [];
+      if (payload.disabled_reason) {
+        html.push(`<div class="status warn">${escapeHtml(payload.disabled_reason)}</div>`);
+      }
+      if (!items.length) {
+        html.push(`<div class="empty">لا توجد توصية مناسبة حاليًا.</div>`);
+        $("recommendations").innerHTML = html.join("");
+        return;
+      }
+      html.push(`<div class="section-title">أفضل اقتراحات السلة</div>`);
+      html.push(...items.map((entry) => {
+        const item = entry.item;
+        return [
+          `<div class="rec-item">`,
+          `<div><strong>${escapeHtml(item.title_ar || item.title_en || "item_" + item.item_id)}</strong>`,
+          `<span>item_id ${item.item_id}</span>`,
+          `<span>المصدر: ${escapeHtml(sourceLabel(item.source))}</span>`,
+          `<span>النوع: ${escapeHtml(typeLabel(entry.section, item.recommendation_type))}</span>`,
+          `<span class="pct-badge">نسبة الأخذ ${formatScorePercent(item.score)}</span></div>`,
+          item.addable === false ? `<button disabled>غير متاح</button>` : `<button data-rec-add="${item.item_id}">+ إضافة</button>`,
+          `</div>`
+        ].join("");
+      }));
+      $("recommendations").innerHTML = html.join("");
+    }
+
+    function pickRecommendationItems(payload){
+      const sections = payload.sections || {};
+      const order = [
+        ["based_on_last_item", "مع آخر صنف"],
+        ["based_on_cart", "حسب السلة"],
+        ["similar_alternatives", "بدائل مشابهة"],
+        ["popular", "الأكثر شيوعًا"]
+      ];
+      const out = [];
+      const seen = new Set();
+      for (const [key, label] of order) {
+        const sectionItems = sections[key] || [];
+        for (const item of sectionItems) {
+          const id = Number(item.item_id);
+          if (!Number.isInteger(id) || seen.has(id) || item.addable === false) continue;
+          seen.add(id);
+          out.push({section: key, item});
+          break;
+        }
+        if (out.length >= 2) return out;
+      }
+      for (const item of payload.top_recommendations || []) {
+        const id = Number(item.item_id);
+        if (!Number.isInteger(id) || seen.has(id) || item.addable === false) continue;
+        seen.add(id);
+        out.push({section: item.recommendation_type || "top_recommendations", item});
+        if (out.length >= 2) return out;
+      }
+      for (const [key, label] of order) {
+        const sectionItems = sections[key] || [];
+        for (const item of sectionItems) {
+          const id = Number(item.item_id);
+          if (!Number.isInteger(id) || seen.has(id) || item.addable === false) continue;
+          seen.add(id);
+          out.push({section: key, item});
+          if (out.length >= 2) return out;
+        }
+      }
+      return out;
+    }
+
+    function sourceLabel(source){
+      return {
+        restaurant_fbt: "FBT داخل المطعم",
+        restaurant_popularity: "الأكثر طلبًا داخل المطعم",
+        item2vec: "تشابه الأصناف",
+        pooled_fbt: "سلوك طلبات مشابه",
+        global_common: "Fallback عام"
+      }[source] || source || "غير محدد";
+    }
+
+    function typeLabel(type, fallbackType){
+      const key = type || fallbackType;
+      return {
+        cross_sell: "مقترح مع السلة",
+        popular: "الأكثر شيوعًا",
+        similar_alternative: "بديل مشابه",
+        based_on_last_item: "مقترح مع آخر صنف",
+        based_on_cart: "مقترح مع السلة",
+        top_recommendations: "أفضل النتائج"
+      }[key] || key || "اقتراح";
+    }
+
+    function starterItemId(){
+      const starter = menuPayload && menuPayload.default_cart_item_ids && menuPayload.default_cart_item_ids[0];
+      if (starter) return Number(starter);
+      const first = items.find((item) => item.has_cross_sell || item.popularity_rank) || items[0];
+      return first ? Number(first.item_id) : null;
+    }
+
+    function addStarter(){
+      const starter = starterItemId();
+      if (starter) addToCart(starter);
+    }
+
+    async function openSmartWidget(){
+      if (!menuPayload) await loadMenu();
+      const instance = await initWidget();
+      instance.open();
+      syncWidget();
+    }
+
+    function escapeHtml(value){
+      return String(value == null ? "" : value).replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[ch]));
+    }
+
+    document.addEventListener("click", (event) => {
+      const add = event.target.closest("[data-add]");
+      if (add) addToCart(add.getAttribute("data-add"));
+      const recAdd = event.target.closest("[data-rec-add]");
+      if (recAdd) addToCart(recAdd.getAttribute("data-rec-add"));
+      const inc = event.target.closest("[data-inc]");
+      if (inc) addToCart(inc.getAttribute("data-inc"));
+      const dec = event.target.closest("[data-dec]");
+      if (dec) decrement(dec.getAttribute("data-dec"));
+      const cat = event.target.closest("[data-category]");
+      if (cat) {
+        selectedCategory = cat.getAttribute("data-category");
+        $("categorySelect").value = selectedCategory;
+        document.querySelectorAll(".cat-pill").forEach((btn) => btn.classList.toggle("active", btn === cat));
+        renderMenu();
+      }
+    });
+
+    $("openWidgetBtn").addEventListener("click", openSmartWidget);
+    $("sampleOtherBtn").addEventListener("click", () => {
+      $("restaurantId").value = "172";
+      cart = [];
+      lastAddedItemId = null;
+      loadMenu();
+    });
+    $("searchInput").addEventListener("input", renderMenu);
+    $("categorySelect").addEventListener("change", () => {
+      selectedCategory = $("categorySelect").value;
+      document.querySelectorAll(".cat-pill").forEach((btn) => btn.classList.toggle("active", btn.getAttribute("data-category") === selectedCategory));
+      renderMenu();
+    });
+    $("limitSelect").addEventListener("change", renderMenu);
+
+    loadMenu();
+  </script>
+</body>
+</html>

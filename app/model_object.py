@@ -29,12 +29,16 @@ def _unique_positive_ints(values) -> list[int]:
     return out
 
 
+def _normalized_title(value: Any) -> str:
+    return " ".join(str(value or "").strip().casefold().split())
+
+
 class BonTechRecommendationModel:
     """
     Prebuilt recommendation model containing all runtime data needed for serving.
     """
 
-    schema_version = "bontech_recommendation_model_file_v1"
+    schema_version = "bontech_recommendation_model_file_v2"
 
     def __init__(
         self,
@@ -45,7 +49,10 @@ class BonTechRecommendationModel:
     ):
         self.engine = engine
         self.model_version = _as_serving_version(getattr(engine, "model_version", "v0"))
-        self.raw_model_version = getattr(engine, "model_version", "v0")
+        # Use one canonical version everywhere in the packaged serving object.
+        self.engine.model_version = self.model_version
+        self.raw_model_version = self.model_version
+        self.artifact_schema_version = self.schema_version
         self.metadata = dict(metadata or {})
         self.source_artifacts = list(source_artifacts or [])
         self.built_at = built_at or datetime.now(timezone.utc).isoformat()
@@ -60,7 +67,10 @@ class BonTechRecommendationModel:
             "global_groups": engine.global_groups,
             "pooled_fbt": engine.pooled,
         }
-        self.customer_profiles = engine.profiles
+        # Customer-level profiles are not needed by the restaurant widget and must
+        # never be distributed inside the portable model artifact.
+        self.engine.profiles = {}
+        self.customer_profiles = {}
         self.item_titles = engine.titles
         self.item_groups = engine.item_group
         self.item_categories = engine.item_category
@@ -93,6 +103,7 @@ class BonTechRecommendationModel:
         last_added_item_id: int | None = None,
         limit: int = 5,
         previous_top_item_id: int | None = None,
+        live_candidates: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         rid = int(restaurant_id)
         top_k = max(1, min(int(limit or 5), 50))
@@ -101,9 +112,11 @@ class BonTechRecommendationModel:
         last_item = int(last_added_item_id) if last_added_item_id else None
         previous_top = int(previous_top_item_id) if previous_top_item_id else None
         excluded = {previous_top} if previous_top else set()
-        candidate_k = min(50, top_k + (1 if previous_top else 0))
+        configured_pool = int(getattr(self.engine, "candidate_pool_size", 40) or 40)
+        candidate_k = min(100, max(top_k * 4, configured_pool, top_k + len(excluded)))
         warnings: list[str] = []
         disabled_reason = None
+        live_items = self._normalize_live_candidates(live_candidates)
 
         sections = {
             "based_on_last_item": [],
@@ -112,19 +125,20 @@ class BonTechRecommendationModel:
             "popular": [],
         }
 
-        if not self.known_restaurant(rid):
+        if last_item and last_item not in cart_set:
+            warnings.append("last_added_item_id_not_in_cart_item_ids")
+            last_item = cart_ids[-1] if cart_ids else None
+
+        if not self.known_restaurant(rid) and not live_items:
             disabled_reason = "unknown_restaurant_or_no_menu_artifacts"
             warnings.append(disabled_reason)
             return self._response(rid, cart_ids, last_item, sections, [], True, disabled_reason, warnings)
 
-        if last_item and last_item not in cart_set:
-            warnings.append("last_added_item_id_not_in_cart_item_ids")
-
         if not cart_ids:
-            popular_items = self.engine.popular(
-                rid,
-                top_k=candidate_k,
-                exclude=list(excluded),
+            popular_items = (
+                self.engine.popular(rid, top_k=candidate_k, exclude=list(excluded))
+                if self.known_restaurant(rid)
+                else []
             )
             popular_payload = {
                 "recommendation_groups": [{"type": "popular", "items": popular_items}],
@@ -136,9 +150,19 @@ class BonTechRecommendationModel:
                 cart_set,
                 set(),
                 ["popular"],
-                top_k,
+                candidate_k,
                 excluded,
             )
+            if not sections["popular"] and live_items:
+                sections["popular"] = self._live_fallback_items(
+                    live_items,
+                    cart_ids,
+                    last_item,
+                    candidate_k,
+                    excluded,
+                    has_cart=False,
+                )
+                warnings.append("live_menu_discovery_fallback")
             warnings.extend(skipped[:10])
             top_recommendations = self._top_recommendations(sections, top_k, has_cart=False)
             if previous_top and not top_recommendations:
@@ -170,11 +194,14 @@ class BonTechRecommendationModel:
                 cart_only=True,
             )
 
-        last_payload = call_engine([last_item]) if last_item else {
+        last_payload = call_engine([last_item]) if last_item and self.known_restaurant(rid) else {
             "recommendation_groups": [],
             "fallback_used": True,
         }
-        cart_payload = call_engine(cart_ids)
+        cart_payload = call_engine(cart_ids) if self.known_restaurant(rid) else {
+            "recommendation_groups": [],
+            "fallback_used": True,
+        }
         skipped_all: list[str] = []
         if last_item:
             sections["based_on_last_item"], skipped = self._pick_group_items(
@@ -183,7 +210,7 @@ class BonTechRecommendationModel:
                 cart_set,
                 set(),
                 ["cross_sell"],
-                top_k,
+                candidate_k,
                 excluded,
             )
             skipped_all.extend(skipped)
@@ -193,7 +220,7 @@ class BonTechRecommendationModel:
             cart_set,
             set(),
             ["cross_sell"],
-            top_k,
+            candidate_k,
             excluded,
         )
         skipped_all.extend(skipped)
@@ -203,10 +230,27 @@ class BonTechRecommendationModel:
             cart_set,
             set(),
             ["similar_alternative"],
-            top_k,
+            candidate_k,
             excluded,
         )
         skipped_all.extend(skipped)
+
+        live_fallback_used = False
+        if live_items:
+            existing = {int(item["item_id"]) for item in sections["based_on_cart"]}
+            reserves = self._live_fallback_items(
+                live_items,
+                cart_ids,
+                last_item,
+                candidate_k,
+                excluded | existing,
+                has_cart=True,
+            )
+            if reserves:
+                sections["based_on_cart"].extend(reserves)
+                live_fallback_used = not bool(sections["based_on_cart"][:-len(reserves)])
+                if live_fallback_used:
+                    warnings.append("live_menu_cart_fallback")
 
         for reason in skipped_all[:10]:
             if reason not in warnings:
@@ -218,12 +262,118 @@ class BonTechRecommendationModel:
         fallback_used = bool(
             last_payload.get("fallback_used")
             or cart_payload.get("fallback_used")
+            or live_fallback_used
             or not top_recommendations
             or disabled_reason
         )
         return self._response(
             rid, cart_ids, last_item, sections, top_recommendations, fallback_used, disabled_reason, warnings
         )
+
+    def _normalize_live_candidates(
+        self,
+        candidates: list[dict[str, Any]] | None,
+    ) -> list[dict[str, Any]]:
+        """Validate and deterministically deduplicate an optional live menu snapshot."""
+        out: list[dict[str, Any]] = []
+        seen_ids: set[int] = set()
+        seen_titles: set[str] = set()
+        for raw in candidates or []:
+            try:
+                item_id = int(raw.get("item_id"))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if item_id < 1 or item_id in seen_ids or raw.get("is_available") is False:
+                continue
+            title_ar = str(raw.get("title_ar") or "").strip()
+            title_en = str(raw.get("title_en") or "").strip()
+            title_key = _normalized_title(title_ar or title_en)
+            if title_key and title_key in seen_titles:
+                continue
+            category_id = raw.get("category_id")
+            try:
+                category_id = int(category_id) if category_id is not None else None
+            except (TypeError, ValueError):
+                category_id = None
+            popularity_rank = raw.get("popularity_rank")
+            try:
+                popularity_rank = max(1, int(popularity_rank)) if popularity_rank is not None else None
+            except (TypeError, ValueError):
+                popularity_rank = None
+            seen_ids.add(item_id)
+            if title_key:
+                seen_titles.add(title_key)
+            out.append({
+                "item_id": item_id,
+                "title_ar": title_ar,
+                "title_en": title_en,
+                "category_id": category_id,
+                "popularity_rank": popularity_rank,
+            })
+        return sorted(out, key=lambda item: int(item["item_id"]))
+
+    def _live_fallback_items(
+        self,
+        candidates: list[dict[str, Any]],
+        cart_item_ids: list[int],
+        last_item_id: int | None,
+        limit: int,
+        excluded_item_ids: set[int],
+        *,
+        has_cart: bool,
+    ) -> list[dict[str, Any]]:
+        """Build a deterministic menu fallback without presenting it as popularity."""
+        cart_set = set(cart_item_ids)
+        by_id = {int(item["item_id"]): item for item in candidates}
+        last_category = by_id.get(int(last_item_id), {}).get("category_id") if last_item_id else None
+        cart_categories = {
+            by_id[item_id].get("category_id")
+            for item_id in cart_set
+            if item_id in by_id and by_id[item_id].get("category_id") is not None
+        }
+
+        ranked: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        for item in candidates:
+            item_id = int(item["item_id"])
+            if item_id in cart_set or item_id in excluded_item_ids:
+                continue
+            category_id = item.get("category_id")
+            same_as_last = bool(last_category is not None and category_id == last_category)
+            outside_cart_categories = bool(category_id is not None and category_id not in cart_categories)
+            popularity_rank = item.get("popularity_rank")
+            rank_signal = 1.0 / float(popularity_rank) if popularity_rank else 0.0
+            score = 0.18 + (0.08 if not same_as_last else 0.0)
+            score += 0.04 if outside_cart_categories else 0.0
+            score += min(0.05, 0.05 * rank_signal)
+            sort_key = (
+                same_as_last,
+                not outside_cart_categories,
+                popularity_rank if popularity_rank is not None else 1_000_000,
+                category_id if category_id is not None else 1_000_000,
+                item_id,
+            )
+            ranked.append((sort_key, {
+                "item_id": item_id,
+                "title_ar": item.get("title_ar") or "",
+                "title_en": item.get("title_en") or "",
+                "score": round(score, 4),
+                "source": "live_menu_fallback",
+                "recommendation_type": "cross_sell" if has_cart else "popular",
+                "reason": (
+                    "اقتراح تكميلي من المنيو المتاح"
+                    if has_cart
+                    else "اقتراح استكشافي من المنيو المتاح"
+                ),
+                "evidence": {
+                    "fallback": "live_menu",
+                    "category_id": category_id,
+                    "avoids_last_item_category": not same_as_last,
+                },
+                "addable": True,
+                "disabled_reason": None,
+            }))
+        ranked.sort(key=lambda row: row[0])
+        return [item for _, item in ranked[: max(1, int(limit))]]
 
     def _response(
         self,

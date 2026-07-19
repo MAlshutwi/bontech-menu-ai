@@ -21,6 +21,10 @@ thresholds:
   popularity_top_n: 25                 # كم صنف شعبي نخزّن لكل مطعم
   global_common_top_n: 30              # كم صنف مشترك عام نخزّن
 
+# --- حداثة بيانات التدريب ---
+training:
+  clean_cache_max_age_hours: 24        # بعد هذه المدة يُعاد السحب بدل إعادة استخدام الكاش
+
 # --- نموذج FBT (ترتيب المرشّحات داخل المطعم) ---
 fbt:
   min_pair_count: 10            # أقل عدد اقتران للزوج عشان نثق فيه
@@ -65,7 +69,7 @@ hybrid_weights:
 
 # --- موديول العميل (خامل افتراضيًا — لا يوجد ربط طلب↔عميل كافٍ) ---
 customer:
-  enabled: true                 # الواجهة شغّالة؛ تُفعّل فعليًا لو توفّر profile
+  enabled: false                # ملفات العملاء لا تُضمّن في مودل التسليم حفاظًا على الخصوصية
   # مصدر الربط الوحيد المتاح حاليًا (سطحي ~0.3% من الطلبات):
   link_source: "customerpointsearned"   # (reservationorderid -> usersid)
   recent_orders_window: 20
@@ -76,6 +80,7 @@ serving:
   exclude_items_in_cart: true       # لا نقترح صنف موجود بالسلة (إلا repeatable)
   only_items_available_in_restaurant: true  # لا نقترح صنف غير موجود بمنيو المطعم
   default_top_k: 5
+  candidate_pool_size: 40          # مرشّحات داخلية قبل فلترة المخزون والقسم في المنيو الحية
   recency_half_life_days: 120       # نصف عمر وزن الحداثة (recency_score)
   # --- أمان تشغيلي (Phase: AI DoD) ---
   enabled: true                     # تعطيل ناعم من config (يتطلب restart)

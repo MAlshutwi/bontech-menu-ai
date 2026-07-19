@@ -89,6 +89,8 @@ export interface CartLine {
   size_title: string;
   price: number | null;
   quantity: number;
+  /** Live stock ceiling for this exact size when the database exposes one. */
+  remaining_quantity: number | null;
 }
 
 export interface WidgetRecommendationItem {
@@ -148,4 +150,21 @@ export interface WidgetRecommendationResponse {
   disabled_reason: string | null;
   threshold_percent: number;
   threshold_fallback_used: boolean;
+}
+
+export type RecommendationEventType = "shown" | "clicked" | "added_to_cart" | "dismissed";
+
+export interface RecommendationEventPayload {
+  event_type: RecommendationEventType;
+  restaurant_id: number;
+  recommended_item_id: number;
+  source: string;
+  request_id?: string;
+  session_id?: string;
+  cart_item_ids: number[];
+  recommendation_type?: string;
+  surface: "cart";
+  rank?: number;
+  score?: number;
+  model_version?: string;
 }

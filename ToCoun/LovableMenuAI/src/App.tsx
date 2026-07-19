@@ -5,6 +5,7 @@ import {
   getRestaurantItemAvailability,
   getRestaurantMenu,
   getRestaurants,
+  sendRecommendationEvent,
 } from "./lib/menuApi";
 import type {
   CartLine,
@@ -13,13 +14,21 @@ import type {
   MenuSize,
   Restaurant,
   RestaurantMenuResponse,
+  RecommendationEventType,
   WidgetRecommendationItem,
   WidgetRecommendationModelGroup,
 } from "./types/menu";
 
 const DEFAULT_RESTAURANT_ID = 192;
-const QUICK_RESTAURANT_IDS = [260, 192];
+const QUICK_RESTAURANT_IDS = [260, 277];
 type RecommendationModelKey = WidgetRecommendationModelGroup["model_key"];
+
+interface RecommendationTrace {
+  requestId: string;
+  modelVersion: string;
+  restaurantId: number;
+  cartItemKey: string;
+}
 
 const restaurantName = (restaurant: Restaurant) =>
   restaurant.name_ar || restaurant.name || `مطعم #${restaurant.restaurant_id}`;
@@ -53,6 +62,19 @@ function availabilityLabel(reason: string) {
       all_sizes_unavailable: "جميع الأحجام نافدة",
     }[reason] || "غير متاح حاليًا"
   );
+}
+
+function getOrCreateSessionId() {
+  const storageKey = "bontech-menu-session";
+  try {
+    const existing = window.sessionStorage.getItem(storageKey);
+    if (existing) return existing;
+    const created = window.crypto.randomUUID();
+    window.sessionStorage.setItem(storageKey, created);
+    return created;
+  } catch {
+    return window.crypto.randomUUID();
+  }
 }
 
 function mergeItemAvailability(
@@ -104,16 +126,29 @@ export default function App() {
   const [loadingRestaurants, setLoadingRestaurants] = useState(true);
   const [loadingMenu, setLoadingMenu] = useState(false);
   const [loadingRecommendation, setLoadingRecommendation] = useState(false);
+  const [addingRecommendation, setAddingRecommendation] = useState(false);
   const [menuRefreshToken, setMenuRefreshToken] = useState(0);
+  const [menuRevision, setMenuRevision] = useState(0);
   const [recommendationRefreshToken, setRecommendationRefreshToken] = useState(0);
+  const [recommendationTrace, setRecommendationTrace] = useState<RecommendationTrace | null>(null);
+  const [busyCartKeys, setBusyCartKeys] = useState<Set<string>>(new Set());
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
+  const [sessionId] = useState(getOrCreateSessionId);
 
   const widgetRef = useRef<HTMLElement>(null);
   const dragRef = useRef<{ pointerId: number; offsetX: number; offsetY: number } | null>(null);
   const activeRestaurantIdRef = useRef<number | null>(null);
   const activeCartSignatureRef = useRef("");
+  const activeCartItemKeyRef = useRef("");
   const lastVisibleRecommendationIdRef = useRef<number | null>(null);
+  const cartRef = useRef<CartLine[]>([]);
+  const lastAddedHistoryRef = useRef<number[]>([]);
+  const forceFreshMenuRef = useRef(false);
+  const recommendationRequestRef = useRef(0);
+  const cartMutationEpochRef = useRef(0);
+  const busyCartKeysRef = useRef(new Set<string>());
+  const shownEventsRef = useRef(new Set<string>());
 
   useEffect(() => {
     getRestaurants()
@@ -134,11 +169,16 @@ export default function App() {
   useEffect(() => {
     if (restaurantId == null) return;
     let cancelled = false;
+    const fresh = forceFreshMenuRef.current;
+    forceFreshMenuRef.current = false;
     setLoadingMenu(true);
     setError("");
-    getRestaurantMenu(restaurantId, false)
+    getRestaurantMenu(restaurantId, false, fresh)
       .then((payload) => {
-        if (!cancelled) setMenu(payload);
+        if (cancelled) return;
+        reconcileCartWithMenu(payload);
+        setMenu(payload);
+        setMenuRevision((revision) => revision + 1);
       })
       .catch((cause: unknown) => {
         if (!cancelled) setError(cause instanceof Error ? cause.message : "تعذر تحميل القائمة");
@@ -152,35 +192,51 @@ export default function App() {
   }, [restaurantId, menuRefreshToken]);
 
   const cartItemIds = useMemo(() => [...new Set(cart.map((line) => line.item_id))], [cart]);
+  const cartItemKey = useMemo(() => [...cartItemIds].sort((a, b) => a - b).join(","), [cartItemIds]);
   const cartSignature = useMemo(
     () => cart.map((line) => `${line.key}:${line.quantity}`).sort().join("|"),
     [cart],
   );
+  cartRef.current = cart;
   activeCartSignatureRef.current = cartSignature;
+  activeCartItemKeyRef.current = cartItemKey;
 
   useEffect(() => {
     if (!restaurantId || menu?.restaurant.restaurant_id !== restaurantId) {
       setModelGroups([]);
+      setRecommendationTrace(null);
       setRecommendationError("");
       setLoadingRecommendation(false);
       return;
     }
 
+    const requestNumber = ++recommendationRequestRef.current;
+    const requestRestaurantId = restaurantId;
+    const requestCartItemKey = cartItemKey;
+    const requestMenu = menu;
+    setModelGroups([]);
+    setRecommendationTrace(null);
+    setSelectedRecommendationId(null);
     setLoadingRecommendation(true);
     setRecommendationError("");
     const controller = new AbortController();
-    const previousTopItemId = lastVisibleRecommendationIdRef.current;
     const timer = window.setTimeout(() => {
+      const previousTopItemId = lastVisibleRecommendationIdRef.current;
       getRecommendationModels(
-        restaurantId,
+        requestRestaurantId,
         cartItemIds,
         lastAddedItemId,
         previousTopItemId,
         controller.signal,
       )
         .then((response) => {
-          if (controller.signal.aborted) return;
-          const liveItems = new Map(menu.items.map((item) => [item.item_id, item]));
+          if (
+            controller.signal.aborted
+            || recommendationRequestRef.current !== requestNumber
+            || activeRestaurantIdRef.current !== requestRestaurantId
+            || activeCartItemKeyRef.current !== requestCartItemKey
+          ) return;
+          const liveItems = new Map(requestMenu.items.map((item) => [item.item_id, item]));
           const cartIds = new Set(cartItemIds);
           const responseGroups = response.models?.length
             ? response.models
@@ -217,6 +273,12 @@ export default function App() {
             return { ...group, available: suggestions.length > 0, suggestions };
           });
           setModelGroups(validGroups);
+          setRecommendationTrace({
+            requestId: response.request_id,
+            modelVersion: response.model_version,
+            restaurantId: requestRestaurantId,
+            cartItemKey: requestCartItemKey,
+          });
           setActiveModelKey((current) => {
             if (validGroups.some((group) => group.model_key === current && group.available)) return current;
             const preferred = validGroups.find(
@@ -230,10 +292,20 @@ export default function App() {
         })
         .catch((cause: unknown) => {
           if (cause instanceof DOMException && cause.name === "AbortError") return;
+          if (
+            recommendationRequestRef.current !== requestNumber
+            || activeRestaurantIdRef.current !== requestRestaurantId
+            || activeCartItemKeyRef.current !== requestCartItemKey
+          ) return;
+          setModelGroups([]);
+          setRecommendationTrace(null);
+          setSelectedRecommendationId(null);
           setRecommendationError(cause instanceof Error ? cause.message : "تعذر تحميل الاقتراح");
         })
         .finally(() => {
-          if (!controller.signal.aborted) setLoadingRecommendation(false);
+          if (!controller.signal.aborted && recommendationRequestRef.current === requestNumber) {
+            setLoadingRecommendation(false);
+          }
         });
     }, 100);
 
@@ -242,10 +314,8 @@ export default function App() {
       controller.abort();
     };
   }, [
-    cartItemIds,
-    lastAddedItemId,
-    menu?.restaurant.restaurant_id,
-    menuRefreshToken,
+    cartItemKey,
+    menuRevision,
     recommendationRefreshToken,
     restaurantId,
   ]);
@@ -256,7 +326,18 @@ export default function App() {
   );
 
   const quickRestaurants = useMemo(
-    () => QUICK_RESTAURANT_IDS.map((id) => restaurants.find((restaurant) => restaurant.restaurant_id === id)).filter(Boolean) as Restaurant[],
+    () => {
+      const preferred = QUICK_RESTAURANT_IDS
+        .map((id) => restaurants.find((restaurant) => restaurant.restaurant_id === id))
+        .filter((restaurant): restaurant is Restaurant => Boolean(restaurant?.active_item_count));
+      const fallback = restaurants.filter(
+        (restaurant) =>
+          restaurant.restaurant_id !== DEFAULT_RESTAURANT_ID
+          && restaurant.active_item_count > 0
+          && !preferred.some((candidate) => candidate.restaurant_id === restaurant.restaurant_id),
+      );
+      return [...preferred, ...fallback].slice(0, 2);
+    },
     [restaurants],
   );
 
@@ -271,8 +352,12 @@ export default function App() {
     });
   }, [categoryId, menu?.items, search]);
 
-  const cartTotal = useMemo(
-    () => cart.reduce((total, line) => total + (line.price || 0) * line.quantity, 0),
+  const cartKnownTotal = useMemo(
+    () => cart.reduce((total, line) => total + (line.price ?? 0) * line.quantity, 0),
+    [cart],
+  );
+  const unknownPriceQuantity = useMemo(
+    () => cart.reduce((total, line) => total + (line.price == null ? line.quantity : 0), 0),
     [cart],
   );
   const cartQuantity = useMemo(() => cart.reduce((total, line) => total + line.quantity, 0), [cart]);
@@ -311,17 +396,64 @@ export default function App() {
     [menu?.items, recommendation?.item_id],
   );
   const recommendationSize =
-    recommendationMenuItem?.sizes.find((size) => !size.is_deleted && size.is_available)
-    || recommendationMenuItem?.sizes.find((size) => !size.is_deleted);
+    recommendationMenuItem?.sizes.find((size) => !size.is_deleted && size.is_available);
+  const recommendationRequiresSize = Boolean(
+    recommendationMenuItem?.sizes.some((size) => !size.is_deleted),
+  );
+  const recommendationCanAdd = Boolean(
+    recommendationMenuItem?.is_available && (!recommendationRequiresSize || recommendationSize),
+  );
   const recommendationScore = Math.round(recommendation?.compatibility_percent || 0);
+
+  function emitRecommendationEvent(
+    eventType: RecommendationEventType,
+    item: WidgetRecommendationItem | null = recommendation,
+  ) {
+    if (
+      !item
+      || !recommendationTrace
+      || recommendationTrace.restaurantId !== restaurantId
+      || recommendationTrace.cartItemKey !== cartItemKey
+    ) return;
+    sendRecommendationEvent({
+      event_type: eventType,
+      restaurant_id: recommendationTrace.restaurantId,
+      recommended_item_id: item.item_id,
+      source: item.source,
+      request_id: recommendationTrace.requestId,
+      session_id: sessionId,
+      cart_item_ids: cartItemIds,
+      recommendation_type: item.recommendation_type,
+      surface: "cart",
+      rank: item.rank,
+      score: item.score,
+      model_version: recommendationTrace.modelVersion,
+    });
+  }
+
+  useEffect(() => {
+    if (!recommendation || !recommendationTrace) return;
+    if (
+      recommendationTrace.restaurantId !== restaurantId
+      || recommendationTrace.cartItemKey !== cartItemKey
+    ) return;
+    const eventKey = `${recommendationTrace.requestId}:${recommendation.model_key}:${recommendation.item_id}`;
+    if (shownEventsRef.current.has(eventKey)) return;
+    shownEventsRef.current.add(eventKey);
+    emitRecommendationEvent("shown", recommendation);
+  }, [recommendation?.item_id, recommendation?.model_key, recommendationTrace?.requestId]);
 
   function changeRestaurant(nextId: number) {
     setRestaurantPickerOpen(false);
     if (!nextId || nextId === restaurantId) return;
     const hadCart = cart.length > 0;
+    cartMutationEpochRef.current += 1;
+    cartRef.current = [];
     setCart([]);
+    lastAddedHistoryRef.current = [];
     setLastAddedItemId(null);
     setModelGroups([]);
+    setRecommendationTrace(null);
     setActiveModelKey("popularity");
     setSelectedRecommendationId(null);
     setDetailsOpen(false);
@@ -335,20 +467,133 @@ export default function App() {
     setNotice(hadCart ? "تم تغيير المطعم وتصفير السلة." : "تم تغيير المطعم.");
   }
 
-  function addToCart(item: MenuItem, size?: MenuSize) {
-    if (!item.is_available || (size && !size.is_available)) {
-      setRecommendationError(availabilityLabel(size?.availability_reason || item.availability_reason));
-      return;
-    }
-    const key = `${item.item_id}:${size?.item_size_id || 0}`;
-    setCart((current) => {
-      const existing = current.find((line) => line.key === key);
-      if (existing) {
-        return current.map((line) => (line.key === key ? { ...line, quantity: line.quantity + 1 } : line));
-      }
-      return [
+  function updateMenuItem(liveItem: MenuItem, expectedRestaurantId: number) {
+    setMenu((current) => {
+      if (!current || current.restaurant.restaurant_id !== expectedRestaurantId) return current;
+      return {
         ...current,
-        {
+        items: current.items.map((item) => (item.item_id === liveItem.item_id ? liveItem : item)),
+      };
+    });
+  }
+
+  function syncLastAddedWithCart(next: CartLine[]) {
+    const remainingIds = new Set(next.map((line) => line.item_id));
+    lastAddedHistoryRef.current = lastAddedHistoryRef.current.filter((itemId) => remainingIds.has(itemId));
+    if (!lastAddedHistoryRef.current.length && next.length) {
+      lastAddedHistoryRef.current = [next[next.length - 1].item_id];
+    }
+    setLastAddedItemId(lastAddedHistoryRef.current.at(-1) ?? null);
+  }
+
+  function recordLastAdded(itemId: number) {
+    lastAddedHistoryRef.current = [...lastAddedHistoryRef.current, itemId].slice(-200);
+    setLastAddedItemId(itemId);
+  }
+
+  function replaceCart(next: CartLine[]) {
+    cartRef.current = next;
+    setCart(next);
+  }
+
+  function reconcileCartWithMenu(payload: RestaurantMenuResponse) {
+    const current = cartRef.current;
+    if (!current.length) return;
+    const liveItems = new Map(payload.items.map((item) => [item.item_id, item]));
+    let removed = 0;
+    let adjusted = 0;
+    let pricesUpdated = 0;
+    const next: CartLine[] = [];
+    for (const line of current) {
+      const item = liveItems.get(line.item_id);
+      if (!item?.is_available) {
+        removed += line.quantity;
+        continue;
+      }
+      if (line.item_size_id != null) {
+        const size = item.sizes.find(
+          (candidate) => candidate.item_size_id === line.item_size_id && !candidate.is_deleted,
+        );
+        if (!size?.is_available) {
+          removed += line.quantity;
+          continue;
+        }
+        const quantity = size.remaining_quantity == null
+          ? line.quantity
+          : Math.min(line.quantity, Math.max(0, size.remaining_quantity));
+        if (quantity <= 0) {
+          removed += line.quantity;
+          continue;
+        }
+        if (quantity !== line.quantity) adjusted += line.quantity - quantity;
+        if (line.price !== size.price) pricesUpdated += quantity;
+        next.push({
+          ...line,
+          title: itemName(item),
+          size_title: sizeName(size),
+          price: size.price,
+          quantity,
+          remaining_quantity: size.remaining_quantity,
+        });
+      } else {
+        const nowRequiresSize = item.sizes.some((size) => !size.is_deleted);
+        if (nowRequiresSize) {
+          removed += line.quantity;
+          continue;
+        }
+        next.push({
+          ...line,
+          title: itemName(item),
+          price: null,
+          remaining_quantity: null,
+        });
+      }
+    }
+    const changed = removed > 0
+      || adjusted > 0
+      || next.some((line, index) => {
+        const old = current[index];
+        return !old || old.price !== line.price || old.title !== line.title || old.size_title !== line.size_title;
+      });
+    if (!changed) return;
+    replaceCart(next);
+    syncLastAddedWithCart(next);
+    if (removed || adjusted || pricesUpdated) {
+      const parts = [
+        removed ? `إزالة ${removed.toLocaleString("ar-SA")} غير متاح` : "",
+        adjusted ? `تخفيض ${adjusted.toLocaleString("ar-SA")} حسب المخزون` : "",
+        pricesUpdated ? `تحديث سعر ${pricesUpdated.toLocaleString("ar-SA")} عنصر` : "",
+      ].filter(Boolean);
+      setNotice(`تمت مزامنة السلة مع المنيو: ${parts.join("، ")}.`);
+    }
+  }
+
+  function setCartKeyBusy(key: string, busy: boolean) {
+    if (busy) busyCartKeysRef.current.add(key);
+    else busyCartKeysRef.current.delete(key);
+    setBusyCartKeys(new Set(busyCartKeysRef.current));
+  }
+
+  function commitLiveCartAddition(item: MenuItem, size?: MenuSize): boolean {
+    const key = `${item.item_id}:${size?.item_size_id || 0}`;
+    const current = cartRef.current;
+    const existing = current.find((line) => line.key === key);
+    const stockLimit = size?.remaining_quantity ?? null;
+    if (stockLimit != null && (existing?.quantity || 0) >= stockLimit) {
+      setRecommendationError(`الكمية المتاحة من ${itemName(item)} هي ${stockLimit.toLocaleString("ar-SA")} فقط.`);
+      setWidgetOpen(true);
+      return false;
+    }
+    const next = existing
+      ? current.map((line) => (line.key === key ? {
+          ...line,
+          title: itemName(item),
+          size_title: sizeName(size),
+          price: size?.price ?? null,
+          remaining_quantity: stockLimit,
+          quantity: line.quantity + 1,
+        } : line))
+      : [...current, {
           key,
           item_id: item.item_id,
           item_size_id: size?.item_size_id || null,
@@ -356,37 +601,100 @@ export default function App() {
           size_title: sizeName(size),
           price: size?.price ?? null,
           quantity: 1,
-        },
-      ];
-    });
-    setLastAddedItemId(item.item_id);
+          remaining_quantity: stockLimit,
+        }];
+    replaceCart(next);
+    recordLastAdded(item.item_id);
     setWidgetOpen(true);
     setNotice("");
+    return true;
+  }
+
+  async function addToCart(item: MenuItem, size?: MenuSize): Promise<boolean> {
+    if (!restaurantId || item.restaurant_id !== restaurantId) return false;
+    if (!item.is_available || (size && !size.is_available)) {
+      setRecommendationError(availabilityLabel(size?.availability_reason || item.availability_reason));
+      setWidgetOpen(true);
+      return false;
+    }
+    const key = `${item.item_id}:${size?.item_size_id || 0}`;
+    if (busyCartKeysRef.current.has(key)) return false;
+    const requestRestaurantId = restaurantId;
+    const requestCartEpoch = cartMutationEpochRef.current;
+    const requestedSizeId = size?.item_size_id ?? null;
+    const displayedPrice = size?.price ?? null;
+    setCartKeyBusy(key, true);
+    setRecommendationError("");
+    try {
+      const availability = await getRestaurantItemAvailability(requestRestaurantId, item.item_id);
+      if (
+        activeRestaurantIdRef.current !== requestRestaurantId
+        || cartMutationEpochRef.current !== requestCartEpoch
+      ) return false;
+      const liveItem = mergeItemAvailability(item, availability);
+      updateMenuItem(liveItem, requestRestaurantId);
+      const liveSize = requestedSizeId == null
+        ? undefined
+        : liveItem.sizes.find((candidate) => candidate.item_size_id === requestedSizeId);
+      const requiresSize = liveItem.sizes.some((candidate) => !candidate.is_deleted);
+      if (!liveItem.is_available || (requestedSizeId != null && !liveSize?.is_available) || (requestedSizeId == null && requiresSize)) {
+        setRecommendationError(requestedSizeId != null
+          ? `الحجم المختار من ${itemName(item)} لم يعد متاحًا.`
+          : availabilityLabel(liveItem.availability_reason));
+        setWidgetOpen(true);
+        return false;
+      }
+      if (liveSize && liveSize.price !== displayedPrice) {
+        setRecommendationError(`تغيّر سعر ${itemName(item)} إلى ${formatPrice(liveSize.price)}؛ راجع السعر ثم أضفه مجددًا.`);
+        setWidgetOpen(true);
+        return false;
+      }
+      return commitLiveCartAddition(liveItem, liveSize);
+    } catch (cause: unknown) {
+      if (
+        activeRestaurantIdRef.current !== requestRestaurantId
+        || cartMutationEpochRef.current !== requestCartEpoch
+      ) return false;
+      setRecommendationError(cause instanceof Error ? cause.message : "تعذر التحقق من المخزون");
+      setWidgetOpen(true);
+      return false;
+    } finally {
+      setCartKeyBusy(key, false);
+    }
   }
 
   function changeQuantity(key: string, delta: number) {
-    setCart((current) => {
-      const next = current
-        .map((line) => (line.key === key ? { ...line, quantity: line.quantity + delta } : line))
-        .filter((line) => line.quantity > 0);
-      const changed = next.find((line) => line.key === key);
-      setLastAddedItemId(delta > 0 && changed ? changed.item_id : next.at(-1)?.item_id || null);
-      return next;
-    });
+    const line = cartRef.current.find((candidate) => candidate.key === key);
+    if (!line) return;
+    if (delta > 0) {
+      const item = menu?.items.find((candidate) => candidate.item_id === line.item_id);
+      const size = item?.sizes.find((candidate) => candidate.item_size_id === line.item_size_id);
+      if (item) void addToCart(item, size);
+      return;
+    }
+    cartMutationEpochRef.current += 1;
+    const next = cartRef.current
+      .map((candidate) => (candidate.key === key ? { ...candidate, quantity: candidate.quantity - 1 } : candidate))
+      .filter((candidate) => candidate.quantity > 0);
+    replaceCart(next);
+    if (!next.some((candidate) => candidate.item_id === line.item_id)) syncLastAddedWithCart(next);
   }
 
   function removeCartLine(key: string) {
-    setCart((current) => {
-      const next = current.filter((line) => line.key !== key);
-      setLastAddedItemId(next.at(-1)?.item_id || null);
-      return next;
-    });
+    cartMutationEpochRef.current += 1;
+    const next = cartRef.current.filter((line) => line.key !== key);
+    replaceCart(next);
+    syncLastAddedWithCart(next);
   }
 
   function clearCart() {
+    cartMutationEpochRef.current += 1;
+    cartRef.current = [];
     setCart([]);
+    lastAddedHistoryRef.current = [];
     setLastAddedItemId(null);
     setModelGroups([]);
+    setRecommendationTrace(null);
     setActiveModelKey("popularity");
     setSelectedRecommendationId(null);
     setDetailsOpen(false);
@@ -419,8 +727,12 @@ export default function App() {
     const requestRecommendationId = recommendation.item_id;
     const requestMenuItem = recommendationMenuItem;
     const preferredSizeId = recommendationSize?.item_size_id;
+    const displayedPrice = recommendationSize?.price ?? null;
     const requestCartSignature = cartSignature;
-    setLoadingRecommendation(true);
+    const requestCartEpoch = cartMutationEpochRef.current;
+    const requestRecommendation = recommendation;
+    emitRecommendationEvent("clicked", requestRecommendation);
+    setAddingRecommendation(true);
     setRecommendationError("");
     try {
       const availability = await getRestaurantItemAvailability(
@@ -430,27 +742,30 @@ export default function App() {
       if (
         activeRestaurantIdRef.current !== requestRestaurantId
         || activeCartSignatureRef.current !== requestCartSignature
+        || cartMutationEpochRef.current !== requestCartEpoch
       ) return;
       const liveItem = mergeItemAvailability(requestMenuItem, availability);
-      setMenu((current) => {
-        if (!current || current.restaurant.restaurant_id !== requestRestaurantId) return current;
-        return {
-          ...current,
-          items: current.items.map((item) => (
-            item.item_id === requestRecommendationId ? liveItem : item
-          )),
-        };
-      });
-      const liveSize =
-        liveItem.sizes.find((size) => size.item_size_id === preferredSizeId && size.is_available)
-        || liveItem.sizes.find((size) => size.is_available);
-      if (!liveItem.is_available || (liveItem.sizes.length > 0 && !liveSize)) {
+      updateMenuItem(liveItem, requestRestaurantId);
+      const liveSize = preferredSizeId == null
+        ? undefined
+        : liveItem.sizes.find((size) => size.item_size_id === preferredSizeId);
+      const requiresSize = liveItem.sizes.some((size) => !size.is_deleted);
+      if (!liveItem.is_available || (requiresSize && !liveSize?.is_available)) {
         removeModelSuggestions((item) => item.item_id === requestRecommendationId);
-        setRecommendationError("هذا الاقتراح نفد من المخزون، جاري اختيار بديل متاح.");
+        setRecommendationError(
+          requiresSize
+            ? "الحجم المعروض لهذا الاقتراح لم يعد متاحًا؛ لن نستبدله بحجم أو سعر مختلف."
+            : "هذا الاقتراح نفد من المخزون، جاري اختيار بديل متاح.",
+        );
         setRecommendationRefreshToken((token) => token + 1);
         return;
       }
-      addToCart(liveItem, liveSize);
+      if (liveSize && liveSize.price !== displayedPrice) {
+        setRecommendationError(`تغيّر السعر إلى ${formatPrice(liveSize.price)}؛ راجع السعر الجديد ثم اضغط إضافة مجددًا.`);
+        return;
+      }
+      if (!commitLiveCartAddition(liveItem, liveSize)) return;
+      emitRecommendationEvent("added_to_cart", requestRecommendation);
       removeModelSuggestions(
         (item) =>
           item.item_id === liveItem.item_id
@@ -461,16 +776,29 @@ export default function App() {
       if (
         activeRestaurantIdRef.current !== requestRestaurantId
         || activeCartSignatureRef.current !== requestCartSignature
+        || cartMutationEpochRef.current !== requestCartEpoch
       ) return;
       setRecommendationError(cause instanceof Error ? cause.message : "تعذر التحقق من توفر الاقتراح");
     } finally {
-      if (
-        activeRestaurantIdRef.current === requestRestaurantId
-        && activeCartSignatureRef.current === requestCartSignature
-      ) {
-        setLoadingRecommendation(false);
-      }
+      setAddingRecommendation(false);
     }
+  }
+
+  function refreshMenu() {
+    if (!restaurantId || loadingMenu) return;
+    forceFreshMenuRef.current = true;
+    recommendationRequestRef.current += 1;
+    setModelGroups([]);
+    setRecommendationTrace(null);
+    setSelectedRecommendationId(null);
+    setRecommendationError("");
+    setLoadingRecommendation(false);
+    setMenuRefreshToken((token) => token + 1);
+  }
+
+  function dismissWidget() {
+    emitRecommendationEvent("dismissed");
+    setWidgetOpen(false);
   }
 
   function beginWidgetDrag(event: ReactPointerEvent<HTMLElement>) {
@@ -500,6 +828,21 @@ export default function App() {
   const widgetStyle: CSSProperties | undefined = widgetPosition
     ? { left: widgetPosition.left, top: widgetPosition.top, right: "auto", bottom: "auto" }
     : undefined;
+
+  useEffect(() => {
+    if (!widgetOpen || !widgetRef.current || !widgetPosition) return;
+    const frame = window.requestAnimationFrame(() => {
+      if (!widgetRef.current) return;
+      const margin = 10;
+      const maxLeft = Math.max(margin, window.innerWidth - widgetRef.current.offsetWidth - margin);
+      const maxTop = Math.max(margin, window.innerHeight - widgetRef.current.offsetHeight - margin);
+      setWidgetPosition((current) => current ? {
+        left: Math.max(margin, Math.min(maxLeft, current.left)),
+        top: Math.max(margin, Math.min(maxTop, current.top)),
+      } : current);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [detailsOpen, modelGroups, recommendationError, widgetOpen]);
 
   return (
     <div className="restaurant-app" dir="rtl">
@@ -541,8 +884,8 @@ export default function App() {
             <strong>{restaurantName(restaurant)}</strong>
           </button>
         ))}
-        <button className="refresh-button" type="button" onClick={() => setMenuRefreshToken((token) => token + 1)} disabled={!restaurantId || loadingMenu}>
-          ↻ تحديث المنيو
+        <button className="refresh-button" type="button" onClick={refreshMenu} disabled={!restaurantId || loadingMenu}>
+          {loadingMenu ? "جارٍ التحديث…" : "↻ تحديث المنيو"}
         </button>
       </section>
 
@@ -592,8 +935,14 @@ export default function App() {
               </p>
             </div>
             <label className="search-box">
+              <span className="sr-only">البحث في أصناف المنيو</span>
               <span aria-hidden="true">⌕</span>
-              <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="ابحث عن صنف" />
+              <input
+                value={search}
+                onChange={(event) => setSearch(event.target.value)}
+                placeholder="ابحث عن صنف"
+                aria-label="البحث في أصناف المنيو"
+              />
             </label>
           </div>
 
@@ -621,11 +970,11 @@ export default function App() {
                         </span>
                         <button
                           type="button"
-                          onClick={() => addToCart(item, size)}
+                          onClick={() => void addToCart(item, size)}
                           aria-label={`أضف ${itemName(item)} ${sizeName(size)}`}
-                          disabled={!size.is_available}
+                          disabled={!size.is_available || busyCartKeys.has(`${item.item_id}:${size.item_size_id}`)}
                         >
-                          {size.is_available ? "+" : "×"}
+                          {busyCartKeys.has(`${item.item_id}:${size.item_size_id}`) ? "…" : size.is_available ? "+" : "×"}
                         </button>
                       </div>
                     ))
@@ -635,8 +984,12 @@ export default function App() {
                         <b>عادي</b>
                         <small>{item.is_available ? "السعر عند الطلب" : availabilityLabel(item.availability_reason)}</small>
                       </span>
-                      <button type="button" onClick={() => addToCart(item)} disabled={!item.is_available}>
-                        {item.is_available ? "+" : "×"}
+                      <button
+                        type="button"
+                        onClick={() => void addToCart(item)}
+                        disabled={!item.is_available || busyCartKeys.has(`${item.item_id}:0`)}
+                      >
+                        {busyCartKeys.has(`${item.item_id}:0`) ? "…" : item.is_available ? "+" : "×"}
                       </button>
                     </div>
                   )}
@@ -671,9 +1024,19 @@ export default function App() {
                       <span>{line.size_title} · {formatPrice(line.price)}</span>
                     </div>
                     <div className="quantity-control">
-                      <button type="button" onClick={() => changeQuantity(line.key, 1)}>+</button>
+                      <button
+                        type="button"
+                        onClick={() => changeQuantity(line.key, 1)}
+                        disabled={
+                          busyCartKeys.has(line.key)
+                          || (line.remaining_quantity != null && line.quantity >= line.remaining_quantity)
+                        }
+                        aria-label={`زيادة كمية ${line.title}`}
+                      >
+                        {busyCartKeys.has(line.key) ? "…" : "+"}
+                      </button>
                       <b>{line.quantity}</b>
-                      <button type="button" onClick={() => changeQuantity(line.key, -1)}>−</button>
+                      <button type="button" onClick={() => changeQuantity(line.key, -1)} aria-label={`تقليل كمية ${line.title}`}>−</button>
                     </div>
                     <button className="remove-line" type="button" onClick={() => removeCartLine(line.key)} aria-label="حذف الصنف">×</button>
                   </div>
@@ -682,8 +1045,13 @@ export default function App() {
             )}
           </div>
           <div className="cart-total">
-            <span>الإجمالي</span>
-            <strong>{formatPrice(cartTotal)}</strong>
+            <span>
+              الإجمالي
+              {unknownPriceQuantity ? (
+                <small>لا يشمل {unknownPriceQuantity.toLocaleString("ar-SA")} بسعر عند الطلب</small>
+              ) : null}
+            </span>
+            <strong>{formatPrice(cartKnownTotal)}</strong>
           </div>
         </aside>
       </main>
@@ -706,7 +1074,7 @@ export default function App() {
                    : "الأكثر طلبًا إلى أن تضيف للسلة"}
                </small>
              </div>
-            <button type="button" onClick={() => setWidgetOpen(false)} aria-label="إغلاق الويدجت">×</button>
+            <button type="button" onClick={dismissWidget} aria-label="إغلاق الويدجت">×</button>
           </header>
            <div className="widget-body">
              {recommendationError ? <div className="widget-inline-error">{recommendationError}</div> : null}
@@ -766,8 +1134,13 @@ export default function App() {
                      <strong>{recommendationScore.toLocaleString("ar-SA")}%</strong>
                      <small>{recommendation.score_label_ar}</small>
                    </div>
-                   <button type="button" onClick={addRecommendationToCart} disabled={loadingRecommendation}>
-                     {loadingRecommendation ? "جاري التحديث…" : "+ أضف"}
+                   <button
+                     type="button"
+                     onClick={addRecommendationToCart}
+                     disabled={addingRecommendation || !recommendationCanAdd}
+                     title={recommendationCanAdd ? "إضافة الاقتراح" : "لا يوجد الحجم المعروض متاحًا"}
+                   >
+                     {addingRecommendation ? "جاري التحقق…" : "+ أضف"}
                    </button>
                  </div>
                </article>
@@ -801,6 +1174,7 @@ export default function App() {
                          className={item.item_id === recommendation.item_id ? "recommendation-list-row active" : "recommendation-list-row"}
                          key={`${activeModelGroup?.model_key}:${item.model_key}:${item.item_id}`}
                          onClick={() => {
+                           emitRecommendationEvent("clicked", item);
                            setSelectedRecommendationId(item.item_id);
                          }}
                        >

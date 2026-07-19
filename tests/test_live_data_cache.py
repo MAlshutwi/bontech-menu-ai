@@ -54,7 +54,7 @@ def test_menu_query_includes_restaurant_metadata_in_same_statement(monkeypatch):
     db.fetch_restaurant_menu_with_sizes(7, include_inactive=False)
 
     normalized = " ".join(captured["sql"].split())
-    assert "FROM restaurants r LEFT JOIN menuitem mi ON mi.restaurantsid = r.id" in normalized
+    assert "FROM restaurants r JOIN current_menu cm ON true LEFT JOIN menuitem mi ON mi.restaurantsid = r.id" in normalized
     assert "restaurant_name" in normalized
     assert "WHERE r.id = :restaurant_id" in normalized
     assert captured["params"] == {"restaurant_id": 7}
@@ -69,12 +69,6 @@ def test_live_menu_build_uses_combined_result_without_restaurant_lookup(monkeypa
         return _menu_frame()
 
     monkeypatch.setattr(main, "fetch_restaurant_menu_with_sizes", fake_fetch)
-    monkeypatch.setattr(
-        main,
-        "fetch_restaurants",
-        lambda: (_ for _ in ()).throw(AssertionError("second restaurant query is forbidden")),
-    )
-
     payload = main._fetch_live_menu_payload(7)
 
     assert calls == 1
